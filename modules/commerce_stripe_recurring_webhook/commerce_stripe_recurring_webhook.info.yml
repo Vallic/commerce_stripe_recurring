@@ -1,0 +1,7 @@
+name: 'Commerce Stripe Recurring Webhook'
+type: module
+description: 'A signed webhook endpoint for Commerce Stripe Recurring gateways. Leave it off when the site receives Stripe events through an endpoint of its own.'
+package: Commerce (contrib)
+core_version_requirement: ^11
+dependencies:
+  - commerce_stripe_recurring:commerce_stripe_recurring

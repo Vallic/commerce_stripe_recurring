@@ -1,0 +1,31 @@
+commerce_payment.commerce_payment_gateway.plugin.stripe_subscription:
+  type: commerce_payment_gateway_configuration
+  label: 'Stripe subscription'
+  mapping:
+    secret_key:
+      type: string
+      label: 'Secret key'
+    publishable_key:
+      type: string
+      label: 'Publishable key'
+    webhook_secret:
+      type: string
+      label: 'Webhook signing secret'
+    restrict_methods:
+      type: boolean
+      label: 'Offer only the methods named, rather than whatever Stripe allows'
+    instruments:
+      type: sequence
+      label: 'Instruments offered at Stripe Checkout'
+      sequence:
+        type: string
+        label: 'Instrument'
+    interval_months:
+      type: integer
+      label: 'Months between charges when the order does not say'
+    trial_days:
+      type: integer
+      label: 'Days before the first collection'
+    portal:
+      type: string
+      label: 'Customer portal: payment_methods or dashboard'

@@ -1,0 +1,20 @@
+commerce_stripe_recurring.webhook:
+  path: '/stripe/subscription/{commerce_payment_gateway}/webhook'
+  defaults:
+    _controller: '\Drupal\commerce_stripe_recurring_webhook\Controller\WebhookController::receive'
+  methods: [POST]
+  requirements:
+    # Open by design: Stripe posts from its own servers and carries no
+    # session, so there is nobody to authorize. The signature is what makes
+    # it safe: the controller checks it against the gateway's signing secret
+    # before reading a single field, and refuses everything when the gateway
+    # has none.
+    _access: 'TRUE'
+  options:
+    # No authentication provider: a browser's session cookie means nothing
+    # here and must not be read.
+    _auth: []
+    no_cache: 'TRUE'
+    parameters:
+      commerce_payment_gateway:
+        type: 'entity:commerce_payment_gateway'

@@ -1,0 +1,15 @@
+bacs
+changeme
+gatewayfixture
+iban
+idempotently
+langcode
+phpstan
+phpunit
+resends
+sepa
+testmode
+unbilled
+uncollectible
+unconfigured
+whsec

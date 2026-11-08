@@ -1,0 +1,11 @@
+{
+    "name": "drupal/commerce_stripe_recurring",
+    "description": "A Stripe Billing gateway for Drupal Commerce: subscriptions and one-off payments through Stripe Checkout, revisions, cancellations, renewal orders and the customer portal.",
+    "type": "drupal-module",
+    "license": "GPL-2.0-or-later",
+    "require": {
+        "php": ">=8.3",
+        "drupal/commerce": "^3",
+        "stripe/stripe-php": "^21.3"
+    }
+}

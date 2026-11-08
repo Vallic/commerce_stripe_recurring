@@ -1,0 +1,83 @@
+<?php
+
+/**
+ * @file
+ * Puts the payment plugins back that a kernel test cannot discover.
+ *
+ * `PaymentTypeManager` and `PaymentMethodTypeManager` answer with empty
+ * definition lists under a kernel test while `commerce_payment` reports
+ * itself installed — its sibling
+ * managers in the same module and the same directory tree find their plugins,
+ * the classes autoload, the attribute is well formed, and the same manager
+ * answers correctly on a running site. Neither a cleared plugin cache nor a
+ * fresh file-cache prefix changes it.
+ *
+ * So the definitions are supplied rather than discovered. What that costs is
+ * honest and small: each is a copy of the attribute on the class it names, so
+ * a change to one is a change this file does not follow — and the thing under
+ * test is what `RenewalOrders` does with a payment, not how Commerce finds
+ * its plugins.
+ *
+ * `PaymentGatewayManager`, in the same module and the same directory tree,
+ * finds its plugins perfectly. Whatever this is, it is not the module.
+ */
+
+declare(strict_types=1);
+
+use Drupal\Core\StringTranslation\TranslatableMarkup;
+use Drupal\commerce_payment\Plugin\Commerce\PaymentType\PaymentDefault;
+use Drupal\commerce_payment\Plugin\Commerce\PaymentMethodType\CreditCard;
+use Drupal\commerce_stripe_recurring\Plugin\Commerce\PaymentMethodType\StripeSubscription;
+use Drupal\commerce_payment\Plugin\Commerce\PaymentType\PaymentManual;
+
+/**
+ * Implements hook_commerce_payment_type_info_alter().
+ *
+ * @phpstan-param array<string, mixed> $definitions
+ */
+function commerce_stripe_recurring_test_commerce_payment_type_info_alter(array &$definitions): void {
+  $definitions += [
+    'payment_default' => [
+      'id' => 'payment_default',
+      'label' => new TranslatableMarkup('Default'),
+      'workflow' => 'payment_default',
+      'class' => PaymentDefault::class,
+      'provider' => 'commerce_payment',
+    ],
+    'payment_manual' => [
+      'id' => 'payment_manual',
+      'label' => new TranslatableMarkup('Manual'),
+      'workflow' => 'payment_manual',
+      'class' => PaymentManual::class,
+      'provider' => 'commerce_payment',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_commerce_payment_method_type_info_alter().
+ *
+ * The gateway plugin resolves its method types as it is constructed, so an
+ * empty list here stops a `commerce_payment_gateway` being saved at all —
+ * before anything has a chance to record a payment against it.
+ *
+ * @phpstan-param array<string, mixed> $definitions
+ */
+function commerce_stripe_recurring_test_commerce_payment_method_type_info_alter(array &$definitions): void {
+  $definitions += [
+    'credit_card' => [
+      'id' => 'credit_card',
+      'label' => new TranslatableMarkup('Credit card'),
+      'create_label' => new TranslatableMarkup('Credit card'),
+      'class' => CreditCard::class,
+      'provider' => 'commerce_payment',
+    ],
+    'stripe_subscription' => [
+      'id' => 'stripe_subscription',
+      'label' => new TranslatableMarkup('Stripe subscription'),
+      'create_label' => new TranslatableMarkup('Stripe subscription'),
+      'class' => StripeSubscription::class,
+      'provider' => 'commerce_stripe_recurring',
+    ],
+  ];
+}

@@ -1,0 +1,48 @@
+parameters:
+  # Stripe's API base URL, replaced by stripe-mock's in tests. Empty means
+  # Stripe itself; a site never sets it.
+  commerce_stripe_recurring.api_base: ''
+
+  # The names this module writes and the fields it reads. A site sets only
+  # the keys it needs; see Conventions for each one, and README.md.
+  commerce_stripe_recurring.conventions: {}
+
+services:
+  logger.channel.commerce_stripe_recurring:
+    parent: logger.channel_base
+    arguments: ['commerce_stripe_recurring']
+
+  commerce_stripe_recurring.conventions:
+    class: Drupal\commerce_stripe_recurring\Conventions
+    arguments: ['%commerce_stripe_recurring.conventions%']
+  Drupal\commerce_stripe_recurring\Conventions: '@commerce_stripe_recurring.conventions'
+
+  # Where the gateway gets its keys. A site that keeps them in the
+  # environment decorates this service.
+  commerce_stripe_recurring.credentials:
+    class: Drupal\commerce_stripe_recurring\ConfiguredCredentials
+    arguments: ['%commerce_stripe_recurring.api_base%']
+  Drupal\commerce_stripe_recurring\StripeCredentialsInterface: '@commerce_stripe_recurring.credentials'
+
+  # Serializes every write to a subscription order.
+  commerce_stripe_recurring.order_lock:
+    class: Drupal\commerce_stripe_recurring\OrderLock
+    arguments: ['@lock', '@entity_type.manager', '@commerce_stripe_recurring.conventions']
+  Drupal\commerce_stripe_recurring\OrderLock: '@commerce_stripe_recurring.order_lock'
+
+  # An order for every period Stripe bills after the first.
+  commerce_stripe_recurring.renewal_orders:
+    class: Drupal\commerce_stripe_recurring\RenewalOrders
+    autowire: true
+    arguments:
+      $logger: '@logger.channel.commerce_stripe_recurring'
+  Drupal\commerce_stripe_recurring\RenewalOrders: '@commerce_stripe_recurring.renewal_orders'
+
+  # What a Stripe event does to an order: checkout matched, invoice paid
+  # (first, redelivered or renewal), payment failed, subscription ended.
+  commerce_stripe_recurring.order_events:
+    class: Drupal\commerce_stripe_recurring\OrderEvents
+    autowire: true
+    arguments:
+      $logger: '@logger.channel.commerce_stripe_recurring'
+  Drupal\commerce_stripe_recurring\OrderEvents: '@commerce_stripe_recurring.order_events'

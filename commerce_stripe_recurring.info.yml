@@ -1,0 +1,9 @@
+name: 'Commerce Stripe Recurring'
+type: module
+description: 'A Stripe Billing gateway for Commerce: subscriptions and one-off payments through Stripe Checkout, revisions, cancellations, renewal orders and the customer portal.'
+package: Commerce (contrib)
+core_version_requirement: ^11
+dependencies:
+  - commerce:commerce_order
+  - commerce:commerce_payment
+  - commerce:commerce_price

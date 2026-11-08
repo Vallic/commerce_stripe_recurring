@@ -1,0 +1,7 @@
+# Used by the drupal.org GitLab CI phpstan job instead of its level 0 default.
+# Deprecation rules come with phpstan-deprecation-rules, so any use of code
+# deprecated for Drupal 12 fails the job.
+parameters:
+  level: 5
+  paths:
+    - .

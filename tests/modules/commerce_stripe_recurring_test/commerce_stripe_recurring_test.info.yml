@@ -1,0 +1,7 @@
+name: 'Stripe recurring test scaffolding'
+type: module
+description: 'Supplies the payment type definition that plugin discovery does not find under a kernel test.'
+package: Testing
+core_version_requirement: ^11
+dependencies:
+  - commerce:commerce_payment
