@@ -107,7 +107,6 @@ final class ConventionsTest extends KernelTestBase {
    */
   public function testTheSitesKeysAreMergedIntoTheDefaults(): void {
     $conventions = $this->container->get('commerce_stripe_recurring.conventions');
-    $this->assertInstanceOf(Conventions::class, $conventions);
 
     $this->assertSame('shop_line', $conventions->lineMetadataKey);
     $this->assertSame('field_owner', $conventions->ownerField);

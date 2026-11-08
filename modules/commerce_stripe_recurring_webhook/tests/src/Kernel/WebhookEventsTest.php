@@ -44,6 +44,13 @@ final class WebhookEventsTest extends KernelTestBase {
   private const string SECRET = 'whsec_test_secret';
 
   /**
+   * What a test subscriber saw: each event's type, gateway and handled flag.
+   *
+   * @var list<array{string, string|int|null, bool}>
+   */
+  private array $seen = [];
+
+  /**
    * {@inheritdoc}
    *
    * @var string[]
@@ -325,9 +332,8 @@ final class WebhookEventsTest extends KernelTestBase {
    * the site's own code through the same signed endpoint.
    */
   public function testOtherEventsAreHandedToSubscribers(): void {
-    $seen = [];
-    $this->container->get('event_dispatcher')->addListener(WebhookEvent::NAME, static function (WebhookEvent $event) use (&$seen): void {
-      $seen[] = [$event->event->type, $event->gateway->id(), $event->isHandled()];
+    $this->container->get('event_dispatcher')->addListener(WebhookEvent::NAME, function (WebhookEvent $event): void {
+      $this->seen[] = [(string) $event->event->type, $event->gateway->id(), $event->isHandled()];
       if (str_starts_with((string) $event->event->type, 'identity.')) {
         $event->setHandled();
       }
@@ -349,15 +355,15 @@ final class WebhookEventsTest extends KernelTestBase {
     $order = $this->contract();
     $this->post($this->event('customer.subscription.deleted', $this->subscription((int) $order->id(), endedAt: 1_750_000_000, reason: '')));
 
+    // An unsigned event reaches nobody: refused, and missing from the list.
+    $unsigned = $this->post($this->event('customer.updated', ['object' => 'customer', 'id' => 'cus_2']), signWith: 'whsec_wrong');
+    $this->assertSame(400, $unsigned->getStatusCode());
+
     $this->assertSame([
       ['identity.verification_session.verified', 'stripe_subscription', FALSE],
       ['customer.created', 'stripe_subscription', FALSE],
       ['customer.subscription.deleted', 'stripe_subscription', TRUE],
-    ], $seen);
-
-    // An unsigned event reaches nobody.
-    $this->post($this->event('customer.created', ['object' => 'customer', 'id' => 'cus_2']), signWith: 'whsec_wrong');
-    $this->assertCount(3, $seen);
+    ], $this->seen);
   }
 
   /**

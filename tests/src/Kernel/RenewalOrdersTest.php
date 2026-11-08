@@ -147,8 +147,6 @@ final class RenewalOrdersTest extends KernelTestBase {
       ['Backups', 750, 1],
     ]));
 
-    $this->assertInstanceOf(OrderInterface::class, $order);
-
     $titles = array_map(static fn ($item): string => (string) $item->getTitle(), $order->getItems());
     $this->assertSame(['Plan S — monthly', 'Backups'], $titles);
 
@@ -418,7 +416,6 @@ final class RenewalOrdersTest extends KernelTestBase {
   public function testInvoiceWithNoLinesFallsBackToTheSubscription(): void {
     $order = $this->renew($this->invoice(lines: []));
 
-    $this->assertInstanceOf(OrderInterface::class, $order);
     $this->assertCount(1, $order->getItems());
     $this->assertSame('Plan S — monthly', (string) $order->getItems()[0]->getTitle());
   }
