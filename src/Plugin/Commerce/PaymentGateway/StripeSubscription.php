@@ -635,10 +635,11 @@ final class StripeSubscription extends OffsitePaymentGatewayBase implements Recu
   /**
    * What Stripe should carry back about this order.
    *
-   * The order id, and the owner where the site names one (Conventions). Both
-   * are a cross-check when an event comes back, never what decides who an
-   * order belongs to: that is the order's own field. No address, no name:
-   * this is metadata on a third party's record.
+   * The order id, the owner where the site names one, and the site where
+   * settings.php names it (Conventions). All are a cross-check when an event
+   * comes back, never what decides who an order belongs to: that is the
+   * order's own field. No address, no name: this is metadata on a third
+   * party's record.
    *
    * @param \Drupal\commerce_order\Entity\OrderInterface $order
    *   The order.
@@ -655,7 +656,7 @@ final class StripeSubscription extends OffsitePaymentGatewayBase implements Recu
       $metadata[$this->conventions->ownerMetadataKey] = $owner;
     }
 
-    return $metadata;
+    return $metadata + $this->conventions->siteMetadata();
   }
 
   /**
@@ -1490,10 +1491,67 @@ final class StripeSubscription extends OffsitePaymentGatewayBase implements Recu
   }
 
   /**
+   * Names this site on an order's subscription, made before sites were named.
+   *
+   * So the invoices Stripe makes from it from now on carry the name, and
+   * another site on the same account drops their events. Never overwrites a
+   * name already there, never touches a subscription whose metadata names
+   * another order, and leaves an ended subscription alone.
+   *
+   * Run where the orders were made only. A copy of the site's database holds
+   * the same subscription ids, and would name its own copy on the original
+   * site's subscriptions.
+   *
+   * @return bool
+   *   Whether the subscription was named.
+   *
+   * @throws \Drupal\commerce_payment\Exception\PaymentGatewayException
+   *   When Stripe would not answer or would not change it.
+   */
+  public function stampSite(OrderInterface $order): bool {
+    $marker = $this->conventions->siteMetadata();
+    $subscription = (string) $order->getData(self::SUBSCRIPTION_KEY);
+
+    if ($marker === [] || $subscription === '') {
+      return FALSE;
+    }
+
+    try {
+      $current = $this->stripe()->subscriptions->retrieve($subscription);
+    }
+    catch (ApiErrorException $e) {
+      if ($e->getStripeCode() === 'resource_missing') {
+        return FALSE;
+      }
+      throw new PaymentGatewayException(sprintf('Stripe would not show subscription %s: %s', $subscription, $e->getMessage()), 0, $e);
+    }
+
+    $named = $current->metadata->{$this->conventions->siteMetadataKey} ?? NULL;
+    $orderId = $current->metadata->order_id ?? NULL;
+
+    if ((is_scalar($named) && (string) $named !== '')
+      || (is_scalar($orderId) && (string) $orderId !== (string) $order->id())
+      || ($current->status ?? '') === 'canceled') {
+      return FALSE;
+    }
+
+    try {
+      // Stripe merges metadata: the keys already there stay.
+      $this->stripe()->subscriptions->update($subscription, ['metadata' => $marker]);
+    }
+    catch (ApiErrorException $e) {
+      throw new PaymentGatewayException(sprintf('Stripe would not name the site on subscription %s: %s', $subscription, $e->getMessage()), 0, $e);
+    }
+
+    return TRUE;
+  }
+
+  /**
    * {@inheritdoc}
    */
   public function createCustomer(string $email, array $metadata = [], ?string $testClock = NULL): string {
     $parameters = ['email' => $email];
+    $metadata += $this->conventions->siteMetadata();
 
     if ($metadata !== []) {
       $parameters['metadata'] = $metadata;

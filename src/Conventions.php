@@ -7,6 +7,7 @@ namespace Drupal\commerce_stripe_recurring;
 use Drupal\commerce_order\Entity\OrderInterface;
 use Drupal\commerce_order\Entity\OrderItemInterface;
 use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Site\Settings;
 
 /**
  * The names a site chooses: what this module writes, and which fields it reads.
@@ -39,6 +40,12 @@ use Drupal\Core\Entity\EntityInterface;
  *   invoice an order records is written, so a refund or a dispute finds it.
  * - `profile_copy_field`: a boolean profile field. Where the billing profile
  *   has it, a renewal gets its own copy of the profile, marked with it.
+ * - `site_metadata_key`: the metadata key that carries which site made an
+ *   object (siteMetadata()).
+ *
+ * The site itself is not a convention but a setting, since each copy of a
+ * site needs its own: `$settings['commerce_stripe_recurring_site']` in
+ * settings.php.
  */
 final readonly class Conventions {
 
@@ -59,7 +66,13 @@ final readonly class Conventions {
     'closed_item_field' => '',
     'payment_intent_field' => '',
     'profile_copy_field' => '',
+    'site_metadata_key' => 'csr_site',
   ];
+
+  /**
+   * The setting naming this installation of the site to Stripe.
+   */
+  public const string SITE_SETTING = 'commerce_stripe_recurring_site';
 
   /**
    * The metadata key that labels a Stripe subscription item.
@@ -119,12 +132,24 @@ final readonly class Conventions {
   public string $profileCopyField;
 
   /**
+   * The metadata key that carries which site made an object.
+   */
+  public string $siteMetadataKey;
+
+  /**
+   * Which installation of the site this is, or '' when the site set none.
+   */
+  public string $site;
+
+  /**
    * Builds the conventions from the container parameter.
    *
    * @param array<string, mixed> $conventions
    *   The site's values. Keys it leaves out take their defaults.
+   * @param string $site
+   *   Which installation of the site this is; see SITE_SETTING.
    */
-  public function __construct(array $conventions = []) {
+  public function __construct(array $conventions = [], string $site = '') {
     $values = $conventions + self::DEFAULTS;
 
     $this->lineMetadataKey = (string) $values['line_metadata_key'] ?: self::DEFAULTS['line_metadata_key'];
@@ -138,6 +163,59 @@ final readonly class Conventions {
     $this->closedItemField = (string) $values['closed_item_field'];
     $this->paymentIntentField = (string) $values['payment_intent_field'];
     $this->profileCopyField = (string) $values['profile_copy_field'];
+    $this->siteMetadataKey = (string) $values['site_metadata_key'] ?: self::DEFAULTS['site_metadata_key'];
+    $this->site = trim($site);
+  }
+
+  /**
+   * The conventions, with the site named in settings.php.
+   *
+   * @param array<string, mixed> $conventions
+   *   The site's values, from the container parameter.
+   * @param \Drupal\Core\Site\Settings $settings
+   *   The settings.
+   */
+  public static function fromSettings(array $conventions, Settings $settings): self {
+    return new self($conventions, (string) $settings->get(self::SITE_SETTING, ''));
+  }
+
+  /**
+   * The metadata that says this site made an object, or none.
+   *
+   * Stripe sends every event of an account to every endpoint on it, each
+   * signed with that endpoint's own secret, so a site sharing the account
+   * with others verifies their events as readily as its own. Its order ids
+   * are plain numbers that another site's orders have too. This is what
+   * tells them apart: every object made here carries the site's name.
+   *
+   * @return array<string, string>
+   *   The key and the site, or nothing when no site is set.
+   */
+  public function siteMetadata(): array {
+    return $this->site === '' ? [] : [$this->siteMetadataKey => $this->site];
+  }
+
+  /**
+   * Whether a Stripe object was made by another site.
+   *
+   * By the site its metadata names, in the three places it surfaces: an
+   * object's own metadata (a session, a subscription, a payment intent), and
+   * an invoice's parent (`parent.subscription_details`, or
+   * `subscription_details` before the 2025 API versions).
+   *
+   * An object naming no site is not another's: it was made before sites
+   * were named, or by a site that names none, and the other checks decide.
+   * One naming a site while this one names none is another's, since nothing
+   * here wrote it.
+   */
+  public function isForeign(object $object): bool {
+    $key = $this->siteMetadataKey;
+    $claimed = $object->metadata->{$key}
+    ?? $object->parent->subscription_details->metadata->{$key}
+    ?? $object->subscription_details->metadata->{$key}
+    ?? NULL;
+
+    return is_scalar($claimed) && (string) $claimed !== '' && (string) $claimed !== $this->site;
   }
 
   /**

@@ -11,12 +11,14 @@ use Drupal\commerce_order\Entity\OrderItemType;
 use Drupal\commerce_order\Entity\OrderType;
 use Drupal\commerce_stripe_recurring\Conventions;
 use Drupal\Core\DependencyInjection\ContainerBuilder;
+use Drupal\Core\Site\Settings;
 use Drupal\field\Entity\FieldConfig;
 use Drupal\field\Entity\FieldStorageConfig;
 use Drupal\user\Entity\User;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\RunTestsInSeparateProcesses;
+use Stripe\StripeObject;
 
 /**
  * The names a site chooses, and the fields they point at.
@@ -154,6 +156,45 @@ final class ConventionsTest extends KernelTestBase {
     $this->assertSame('1', (new Conventions(['owner_field' => 'field_owner', 'owner_value' => 'id']))->ownerOf($order));
     $this->assertSame('', (new Conventions())->ownerOf($order));
     $this->assertSame('', (new Conventions(['owner_field' => 'field_owner']))->ownerOf(Order::create(['type' => 'default'])));
+  }
+
+  /**
+   * The site is named in settings.php, and travels under its own key.
+   */
+  public function testTheSiteComesFromSettings(): void {
+    $conventions = Conventions::fromSettings([], new Settings([Conventions::SITE_SETTING => ' shop-a ']));
+
+    $this->assertSame('shop-a', $conventions->site);
+    $this->assertSame(['csr_site' => 'shop-a'], $conventions->siteMetadata());
+    $this->assertSame(['shop_site' => 'shop-a'], (new Conventions(['site_metadata_key' => 'shop_site'], 'shop-a'))->siteMetadata());
+    $this->assertSame([], Conventions::fromSettings([], new Settings([]))->siteMetadata(), 'No site, nothing written.');
+  }
+
+  /**
+   * What another site made is told apart wherever Stripe carries the name.
+   *
+   * On a session, a subscription or a payment intent in its own metadata;
+   * on an invoice in its parent's, as the subscription had it when the
+   * invoice was made.
+   */
+  public function testAnotherSitesObjectsAreForeign(): void {
+    $conventions = new Conventions([], 'shop-a');
+    $places = [
+      'own' => fn (string $site): array => ['metadata' => ['csr_site' => $site]],
+      'invoice' => fn (string $site): array => ['parent' => ['subscription_details' => ['metadata' => ['csr_site' => $site]]]],
+      'invoice, before 2025' => fn (string $site): array => ['subscription_details' => ['metadata' => ['csr_site' => $site]]],
+    ];
+
+    foreach ($places as $place => $shape) {
+      $this->assertTrue($conventions->isForeign(StripeObject::constructFrom($shape('shop-b'))), $place);
+      $this->assertFalse($conventions->isForeign(StripeObject::constructFrom($shape('shop-a'))), $place);
+    }
+
+    // Made before sites were named: the other checks decide.
+    $this->assertFalse($conventions->isForeign(StripeObject::constructFrom(['metadata' => ['order_id' => '42']])));
+    $this->assertFalse($conventions->isForeign(StripeObject::constructFrom(['id' => 'cus_1'])));
+    // A site that names none wrote no name, so any name is another's.
+    $this->assertTrue((new Conventions())->isForeign(StripeObject::constructFrom(['metadata' => ['csr_site' => 'shop-b']])));
   }
 
 }

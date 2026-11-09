@@ -263,12 +263,19 @@ final readonly class OrderEvents {
    * invoice's parent (`parent.subscription_details`, `subscription_details`
    * before the 2025 API versions).
    *
+   * An object another site made is never matched (Conventions::isForeign()).
+   *
    * Where the site names an owner (Conventions), an order that has one is a
    * match only when the metadata's owner, if it names one, is the order's:
    * metadata is a cross-check, and one that disagrees refuses the event
    * rather than moves money onto another tenant's order.
    */
   private function orderOf(object $object): ?OrderInterface {
+    // Another site on the same Stripe account: its order 42 is not ours.
+    if ($this->conventions->isForeign($object)) {
+      return NULL;
+    }
+
     $id = $object->client_reference_id
       ?? $object->metadata->order_id
       ?? $object->parent->subscription_details->metadata->order_id

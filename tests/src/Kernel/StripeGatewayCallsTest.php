@@ -14,6 +14,7 @@ use Drupal\commerce_price\Entity\Currency;
 use Drupal\commerce_price\Price;
 use Drupal\commerce_store\Entity\Store;
 use Drupal\commerce_store\Entity\StoreType;
+use Drupal\commerce_stripe_recurring\Conventions;
 use Drupal\commerce_stripe_recurring\Plugin\Commerce\PaymentGateway\StripeSubscription;
 use Drupal\KernelTests\KernelTestBase;
 use Drupal\user\Entity\User;
@@ -359,6 +360,57 @@ final class StripeGatewayCallsTest extends KernelTestBase {
   }
 
   /**
+   * Where settings.php names the site, everything the checkout makes says so.
+   */
+  public function testTheSiteIsNamedOnWhatTheCheckoutMakes(): void {
+    $order = $this->order([['Plan S — monthly', '12.50', 1]]);
+
+    $this->gateway(site: 'shop-a')->createCheckoutSession($order, 'https://example.test/back', 'https://example.test/cancel');
+
+    $sent = $this->sent('checkout.sessions', 'create');
+    $expected = ['order_id' => (string) $order->id(), 'csr_site' => 'shop-a'];
+    $this->assertSame($expected, $sent['metadata']);
+    $this->assertSame($expected, $sent['subscription_data']['metadata']);
+  }
+
+  /**
+   * A subscription made before sites were named is named once.
+   */
+  public function testAnOlderSubscriptionIsNamedOnce(): void {
+    $order = $this->order([['Plan S', '12.50', 1]]);
+    $this->stripe->subscription = StripeObject::constructFrom([
+      'id' => 'sub_test',
+      'status' => 'active',
+      'metadata' => ['order_id' => (string) $order->id()],
+    ]);
+
+    $this->assertTrue($this->gateway(site: 'shop-a')->stampSite($order));
+    $this->assertSame(['sub_test', ['metadata' => ['csr_site' => 'shop-a']]], $this->stripe->call('subscriptions', 'update'));
+  }
+
+  /**
+   * A name already there, another order's subscription or an ended one stay.
+   */
+  public function testWhatIsNotOursToNameIsLeftAlone(): void {
+    $order = $this->order([['Plan S', '12.50', 1]]);
+    $subscriptions = [
+      'named already' => [
+        'status' => 'active',
+        'metadata' => ['order_id' => (string) $order->id(), 'csr_site' => 'shop-b'],
+      ],
+      'another order' => ['status' => 'active', 'metadata' => ['order_id' => '999']],
+      'ended' => ['status' => 'canceled', 'metadata' => ['order_id' => (string) $order->id()]],
+    ];
+
+    foreach ($subscriptions as $case => $subscription) {
+      $this->stripe->subscription = StripeObject::constructFrom(['id' => 'sub_test'] + $subscription);
+      $this->assertFalse($this->gateway(site: 'shop-a')->stampSite($order), $case);
+    }
+    $this->assertFalse($this->gateway()->stampSite($order), 'No site is named.');
+    $this->assertSame(0, $this->stripe->countOf('subscriptions', 'update'));
+  }
+
+  /**
    * A charge is added to the next invoice in cents, once per key.
    */
   public function testChargeIsAddedToTheNextInvoice(): void {
@@ -509,8 +561,10 @@ final class StripeGatewayCallsTest extends KernelTestBase {
    *
    * @param array<string, mixed> $settings
    *   Settings over the defaults.
+   * @param string $site
+   *   The site settings.php names, or '' for the container's conventions.
    */
-  private function gateway(array $settings = []): StripeSubscription {
+  private function gateway(array $settings = [], string $site = ''): StripeSubscription {
     $reflection = new \ReflectionClass(StripeSubscription::class);
 
     /** @var \Drupal\commerce_stripe_recurring\Plugin\Commerce\PaymentGateway\StripeSubscription $plugin */
@@ -524,7 +578,7 @@ final class StripeGatewayCallsTest extends KernelTestBase {
     $reflection->getProperty('stripe')->setValue($plugin, $this->stripe);
     $reflection->getProperty('stringTranslation')->setValue($plugin, $this->container->get('string_translation'));
     $reflection->getProperty('orderLock')->setValue($plugin, $this->container->get('commerce_stripe_recurring.order_lock'));
-    $reflection->getProperty('conventions')->setValue($plugin, $this->container->get('commerce_stripe_recurring.conventions'));
+    $reflection->getProperty('conventions')->setValue($plugin, $site === '' ? $this->container->get('commerce_stripe_recurring.conventions') : new Conventions([], $site));
     $reflection->getProperty('credentials')->setValue($plugin, $this->container->get('commerce_stripe_recurring.credentials'));
     $reflection->getProperty('state')->setValue($plugin, $this->container->get('state'));
 

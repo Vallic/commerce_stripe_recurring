@@ -51,6 +51,7 @@ Some names are the site's to choose: what this module writes into order data and
 | `closed_item_field` | (none) | An order item field. Items with a value in it are closed and not billed. |
 | `payment_intent_field` | (none) | An order field where the order's payment intent is written, so a refund or a dispute can find the order. |
 | `profile_copy_field` | (none) | A boolean profile field. Where the billing profile has it, each renewal gets its own copy of the profile, marked with it. |
+| `site_metadata_key` | `csr_site` | The metadata key that carries which site made a Stripe object. See [Several sites on one Stripe account](#several-sites-on-one-stripe-account). |
 
 Most of these names end up stored in order data or in Stripe, so change them only before any data exists. A site that already has data keeps the names it has been writing.
 
@@ -80,6 +81,27 @@ final class MyModuleServiceProvider extends ServiceProviderBase {
 }
 ```
 
+## Several sites on one Stripe account
+
+Stripe sends every event of an account to every webhook endpoint on it, and signs each with that endpoint's own secret. So a site sharing the account with others verifies their events as readily as its own, and their order ids are numbers its own orders have too. Name each site, and each copy of it, in its `settings.php`:
+
+```php
+$settings['commerce_stripe_recurring_site'] = 'shop-production';
+```
+
+- **What is named.** Every Checkout session, subscription, payment intent and customer the site makes carries the name in its metadata, under `site_metadata_key`. The invoices Stripe makes from a subscription carry it too.
+- **What is dropped.** An event naming another site is acknowledged and dropped. It changes no order, and the site's own `WebhookEvent` subscribers never see it. A site that names none drops every event that names a site.
+- **What still passes.** An event naming no site, such as one about a subscription made before the site was named, goes through the other checks: the order id, the owner, and the subscription and customer the order records. So does an event about an object with no metadata, such as a dispute; a subscriber matches those by its own records.
+- **Copies need their own name.** A copy of the database (staging, a laptop) on the same account holds the same order ids, owners and subscription ids, so the other checks pass there. Only a name of its own tells it apart. Don't change a site's name once objects carry it.
+
+Subscriptions made before the site was named don't carry the name. Once `settings.php` names the site, name it on them, where the orders were made:
+
+```sh
+drush commerce-stripe-recurring:stamp-site
+```
+
+It asks first, never replaces a name already there, and leaves ended subscriptions and those naming another order alone. Never run it on a copy of the database: the copy holds the same subscription ids, and would put its own name on the original site's subscriptions.
+
 ## Order data
 
 The order records what the gateway knows, under keys the site can read:
@@ -104,3 +126,8 @@ vendor/bin/phpunit -c web/core web/modules/contrib/commerce_stripe_recurring
 - `StripeMockGatewayTest` sends real requests to [stripe-mock](https://github.com/stripe/stripe-mock). It reads stripe-mock's URL from `STRIPE_MOCK_URL`, defaulting to `http://stripe-mock:12111`, and skips when that is not set and nothing answers there. In CI it runs as a service.
 - `StripeTestModeTest` talks to real Stripe test mode. It runs only with a sandbox key in `STRIPE_TEST_SECRET_KEY`, and refuses any key that is not a test key.
 - The other tests use an in-process fake of the Stripe client and need nothing else.
+
+## Maintainers
+
+Developed and maintained by [Vallic](https://vallic.com), a Drupal development
+company and the team behind Vallic Cloud, Drupal hosting.

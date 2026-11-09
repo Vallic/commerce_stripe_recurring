@@ -14,6 +14,7 @@ use Drupal\commerce_price\Entity\Currency;
 use Drupal\commerce_price\Price;
 use Drupal\commerce_store\Entity\Store;
 use Drupal\commerce_store\Entity\StoreType;
+use Drupal\commerce_stripe_recurring\Conventions;
 use Drupal\commerce_stripe_recurring\Plugin\Commerce\PaymentGateway\StripeSubscription;
 use Drupal\commerce_stripe_recurring\RenewalOrders;
 use Drupal\commerce_stripe_recurring_webhook\Controller\WebhookController;
@@ -216,6 +217,34 @@ final class WebhookEventsTest extends KernelTestBase {
       $this->assertSame(200, $response->getStatusCode(), 'Stripe would retry this for ever.');
       $this->assertFalse($this->body($response)['handled']);
     }
+  }
+
+  /**
+   * Another site on the same Stripe account: its events change nothing here.
+   *
+   * Stripe signs them with this endpoint's secret all the same, and its
+   * order ids are numbers this site's orders have too.
+   */
+  public function testAnotherSitesEventsAreDroppedUnseen(): void {
+    $this->container->set('commerce_stripe_recurring.conventions', new Conventions([], 'shop-a'));
+    $this->container->get('event_dispatcher')->addListener(WebhookEvent::NAME, function (WebhookEvent $event): void {
+      $this->seen[] = [(string) $event->event->type, $event->gateway->id(), $event->isHandled()];
+    });
+    $order = $this->contract(subscription: NULL);
+    $event = $this->checkout((int) $order->id());
+
+    $event['data']['object']['metadata'] = ['order_id' => (string) $order->id(), 'csr_site' => 'shop-b'];
+    $response = $this->post($event);
+
+    $this->assertSame(200, $response->getStatusCode(), 'Stripe would retry this for ever.');
+    $this->assertFalse($this->body($response)['handled']);
+    $this->assertSame('', (string) $this->reload($order->id())->getData(StripeSubscription::SUBSCRIPTION_KEY));
+    $this->assertSame([], $this->seen, "The site's subscribers were told about another site's event.");
+
+    // This site's own name, the same event: applied.
+    $event['data']['object']['metadata']['csr_site'] = 'shop-a';
+    $this->assertTrue($this->body($this->post($event))['handled']);
+    $this->assertSame('sub_new', (string) $this->reload($order->id())->getData(StripeSubscription::SUBSCRIPTION_KEY));
   }
 
   /**

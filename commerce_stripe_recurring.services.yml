@@ -12,9 +12,11 @@ services:
     parent: logger.channel_base
     arguments: ['commerce_stripe_recurring']
 
+  # With the site named in settings.php, which differs per copy of a site.
   commerce_stripe_recurring.conventions:
     class: Drupal\commerce_stripe_recurring\Conventions
-    arguments: ['%commerce_stripe_recurring.conventions%']
+    factory: ['Drupal\commerce_stripe_recurring\Conventions', 'fromSettings']
+    arguments: ['%commerce_stripe_recurring.conventions%', '@settings']
   Drupal\commerce_stripe_recurring\Conventions: '@commerce_stripe_recurring.conventions'
 
   # Where the gateway gets its keys. A site that keeps them in the

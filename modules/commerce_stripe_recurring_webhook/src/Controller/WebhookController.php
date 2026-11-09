@@ -6,6 +6,7 @@ namespace Drupal\commerce_stripe_recurring_webhook\Controller;
 
 use Drupal\Core\DependencyInjection\ContainerInjectionInterface;
 use Drupal\commerce_payment\Entity\PaymentGatewayInterface;
+use Drupal\commerce_stripe_recurring\Conventions;
 use Drupal\commerce_stripe_recurring\OrderEvents;
 use Drupal\commerce_stripe_recurring\Plugin\Commerce\PaymentGateway\StripeSubscription;
 use Drupal\commerce_stripe_recurring\StripeCredentialsInterface;
@@ -21,9 +22,11 @@ use Symfony\Component\HttpFoundation\Request;
 /**
  * Receives what Stripe says about a subscription after the customer has gone.
  *
- * The signature is checked before anything is read. The order follows the
- * invoice, not the checkout (OrderEvents), and every verified event is then
- * dispatched as a WebhookEvent for the site's own handlers.
+ * The signature is checked before anything is read. An event about what
+ * another site on the same Stripe account made is acknowledged and dropped
+ * (Conventions::isForeign()). The order follows the invoice, not the checkout
+ * (OrderEvents), and every other verified event is then dispatched as a
+ * WebhookEvent for the site's own handlers.
  */
 final class WebhookController implements ContainerInjectionInterface {
 
@@ -32,6 +35,7 @@ final class WebhookController implements ContainerInjectionInterface {
     private readonly StripeCredentialsInterface $credentials,
     private readonly EventDispatcherInterface $eventDispatcher,
     private readonly LoggerInterface $logger,
+    private readonly Conventions $conventions,
   ) {}
 
   /**
@@ -43,6 +47,7 @@ final class WebhookController implements ContainerInjectionInterface {
       $container->get('commerce_stripe_recurring.credentials'),
       $container->get('event_dispatcher'),
       $container->get('logger.channel.commerce_stripe_recurring'),
+      $container->get('commerce_stripe_recurring.conventions'),
     );
   }
 
@@ -90,6 +95,15 @@ final class WebhookController implements ContainerInjectionInterface {
     }
 
     $object = $event->data->object ?? NULL;
+
+    // Stripe sends every event of the account to every endpoint on it, and
+    // signs each with this endpoint's secret: another site on the same
+    // account is verified as readily as this one. What it made is its own
+    // business, and none of this site's subscribers is told about it.
+    if (is_object($object) && $this->conventions->isForeign($object)) {
+      return new JsonResponse(['handled' => FALSE]);
+    }
+
     $handled = is_object($object)
       && $this->orderEvents->handle((string) $event->type, $object, isset($event->created) ? (int) $event->created : NULL);
 
