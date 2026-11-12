@@ -52,10 +52,14 @@ final readonly class FakeStripeService {
       return StripeObject::constructFrom([
         'subscription' => $this->client->sessionSubscription,
         'customer' => $this->client->sessionCustomer,
+        'status' => $this->client->sessionStatus,
+        'metadata' => $this->client->sessionMetadata,
       ]);
     }
 
     if ($this->name === 'checkout.sessions' && $method === 'create') {
+      $this->client->sessionMetadata = (array) ($arguments[0]['metadata'] ?? []);
+
       return Session::constructFrom(['id' => 'cs_test_made', 'url' => 'https://checkout.stripe.test/cs_test_made']);
     }
 

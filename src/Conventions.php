@@ -42,6 +42,13 @@ use Drupal\Core\Site\Settings;
  *   has it, a renewal gets its own copy of the profile, marked with it.
  * - `site_metadata_key`: the metadata key that carries which site made an
  *   object (siteMetadata()).
+ * - `contents_metadata_key`: the metadata key that carries what a checkout
+ *   was opened for: the lines and the trial, as one value
+ *   (StripeSubscription::contentsOf()).
+ * - `monthly_prices`: whether the order is priced for one month. Off, a line
+ *   is sent at its adjusted unit price, whatever the months between charges.
+ *   On, Stripe is sent the amount for the whole period: each line with its
+ *   share of the order's own adjustments, times the months between charges.
  *
  * The site itself is not a convention but a setting, since each copy of a
  * site needs its own: `$settings['commerce_stripe_recurring_site']` in
@@ -67,6 +74,8 @@ final readonly class Conventions {
     'payment_intent_field' => '',
     'profile_copy_field' => '',
     'site_metadata_key' => 'csr_site',
+    'contents_metadata_key' => 'csr_contents',
+    'monthly_prices' => FALSE,
   ];
 
   /**
@@ -137,6 +146,16 @@ final readonly class Conventions {
   public string $siteMetadataKey;
 
   /**
+   * The metadata key that carries what a checkout was opened for.
+   */
+  public string $contentsMetadataKey;
+
+  /**
+   * Whether the order's prices are for one month.
+   */
+  public bool $monthlyPrices;
+
+  /**
    * Which installation of the site this is, or '' when the site set none.
    */
   public string $site;
@@ -164,6 +183,8 @@ final readonly class Conventions {
     $this->paymentIntentField = (string) $values['payment_intent_field'];
     $this->profileCopyField = (string) $values['profile_copy_field'];
     $this->siteMetadataKey = (string) $values['site_metadata_key'] ?: self::DEFAULTS['site_metadata_key'];
+    $this->contentsMetadataKey = (string) $values['contents_metadata_key'] ?: self::DEFAULTS['contents_metadata_key'];
+    $this->monthlyPrices = filter_var($values['monthly_prices'], FILTER_VALIDATE_BOOLEAN);
     $this->site = trim($site);
   }
 
@@ -216,6 +237,23 @@ final readonly class Conventions {
     ?? NULL;
 
     return is_scalar($claimed) && (string) $claimed !== '' && (string) $claimed !== $this->site;
+  }
+
+  /**
+   * What a Stripe object says its checkout was opened for, or ''.
+   *
+   * Read where isForeign() reads the site: an object's own metadata (a
+   * session, a subscription, a payment intent), and an invoice's parent, as
+   * the subscription had it when the invoice was made.
+   */
+  public function contentsClaimedBy(object $object): string {
+    $key = $this->contentsMetadataKey;
+    $claimed = $object->metadata->{$key}
+    ?? $object->parent->subscription_details->metadata->{$key}
+    ?? $object->subscription_details->metadata->{$key}
+    ?? NULL;
+
+    return is_scalar($claimed) ? (string) $claimed : '';
   }
 
   /**

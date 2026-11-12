@@ -120,6 +120,17 @@ final class StripeSubscription extends OffsitePaymentGatewayBase implements Recu
   public const string TRIAL_KEY = 'stripe_trial_days';
 
   /**
+   * On the order: the subscriptions of checkouts opened for something else.
+   *
+   * A checkout is opened for the order's lines and trial as they stood then.
+   * One that completes after the order has changed bills what it showed, not
+   * what the order holds, so it never places the order (OrderEvents). The
+   * money may have moved all the same: the subscriptions are listed here, by
+   * id, for the site to cancel and refund.
+   */
+  public const string MISMATCH_KEY = 'stripe_checkout_mismatch';
+
+  /**
    * The Stripe client, built on first use.
    */
   protected ?StripeClient $stripe = NULL;
@@ -393,13 +404,16 @@ final class StripeSubscription extends OffsitePaymentGatewayBase implements Recu
    *   When Stripe refuses to open one.
    */
   public function createCheckoutSession(OrderInterface $order, string $returnUrl, string $cancelUrl): CheckoutSession {
-    $subscriptionData = ['metadata' => $this->metadata($order)];
+    $lineItems = $this->lineItems($order);
+    $trial = $this->trialOf($order);
 
-    // The order's own, where it has one: a trial is decided per customer,
-    // and the gateway's setting is only what applies to everybody else.
-    $trial = $order->getData(self::TRIAL_KEY) !== NULL
-      ? (int) $order->getData(self::TRIAL_KEY)
-      : (int) $this->configuration['trial_days'];
+    // What this checkout is opened for travels with it, on the session and
+    // on the subscription it makes, so whatever it goes on to pay for can be
+    // held against the order as the order stands then (contentsOf()).
+    $metadata = $this->metadata($order) + [
+      $this->conventions->contentsMetadataKey => self::digestOf($lineItems, $trial),
+    ];
+    $subscriptionData = ['metadata' => $metadata];
 
     if ($trial > 0) {
       $subscriptionData['trial_period_days'] = $trial;
@@ -411,9 +425,11 @@ final class StripeSubscription extends OffsitePaymentGatewayBase implements Recu
       $subscriptionData['trial_settings'] = ['end_behavior' => ['missing_payment_method' => 'cancel']];
     }
 
-    try {
-      $lineItems = $this->lineItems($order);
+    // One checkout at a time: the one the order was sent to before, if it
+    // is still open, is closed before another is opened.
+    $this->closeEarlierSession($order);
 
+    try {
       $parameters = [
         'mode' => 'subscription',
         'line_items' => $lineItems,
@@ -421,7 +437,7 @@ final class StripeSubscription extends OffsitePaymentGatewayBase implements Recu
         'cancel_url' => $cancelUrl,
         'client_reference_id' => (string) $order->id(),
         'subscription_data' => $subscriptionData,
-        'metadata' => $this->metadata($order),
+        'metadata' => $metadata,
       ];
 
       if ($trial > 0) {
@@ -530,6 +546,16 @@ final class StripeSubscription extends OffsitePaymentGatewayBase implements Recu
    * which is what a subscription is. Usage billed in arrears goes through
    * addToNextInvoice().
    *
+   * What a line's price is for is the site's to say (Conventions). By
+   * default it is the amount of one charge, however many months lie between
+   * two of them. Where the site prices its orders for one month, the lines
+   * are sent for the whole period instead (forThePeriod()).
+   *
+   * Every caller reads the lines from here: the checkout, the invoiced
+   * subscription, a revision, the comparison with what Stripe bills and the
+   * record of what a checkout was opened for. So they cannot disagree about
+   * an amount.
+   *
    * @param \Drupal\commerce_order\Entity\OrderInterface $order
    *   The order.
    * @param bool $recurring
@@ -537,6 +563,9 @@ final class StripeSubscription extends OffsitePaymentGatewayBase implements Recu
    *
    * @return array<int, array<string, mixed>>
    *   Stripe line items.
+   *
+   * @throws \Drupal\commerce_payment\Exception\PaymentGatewayException
+   *   When the order has nothing Stripe can bill.
    */
   private function lineItems(OrderInterface $order, bool $recurring = TRUE): array {
     $items = [];
@@ -599,7 +628,248 @@ final class StripeSubscription extends OffsitePaymentGatewayBase implements Recu
       throw new PaymentGatewayException('There is nothing on this order that Stripe can bill.');
     }
 
+    if ($this->conventions->monthlyPrices) {
+      return $this->forThePeriod($items, $order, (int) ($recurrence['interval_count'] ?? 1));
+    }
+
     return $items;
+  }
+
+  /**
+   * The lines of an order priced for one month, as amounts for the period.
+   *
+   * Only where the site says its prices are for one month
+   * (Conventions::$monthlyPrices). Such an order's total is what one month
+   * costs, and a subscription charged every three months owes three of
+   * them: sent as it stands, Stripe would collect one month's amount once a
+   * quarter. So each line is multiplied by the months between charges.
+   *
+   * The order's own adjustments come along. A discount for paying ahead is
+   * on the order, not on a line, and Stripe is given lines only. Each line
+   * takes its share, in proportion to what it costs, so that what Stripe
+   * collects for a period is the order's total times the months in it. A
+   * one-off payment has no months, and takes the adjustments alone.
+   *
+   * To the cent wherever a line of one unit exists to take what rounding
+   * leaves. A line of several units can only move by its quantity, so an
+   * order of nothing but such lines may come out a few cents either side.
+   *
+   * An adjustment that should be collected once, such as a credit, does not
+   * belong on a subscription order here: it would come off every period.
+   *
+   * @param array<int, array<string, mixed>> $lines
+   *   The lines, at one month's amount.
+   * @param \Drupal\commerce_order\Entity\OrderInterface $order
+   *   The order.
+   * @param int $months
+   *   The months between charges; 1 for a one-off payment.
+   *
+   * @return array<int, array<string, mixed>>
+   *   The lines, at the period's amount.
+   *
+   * @throws \Drupal\commerce_payment\Exception\PaymentGatewayException
+   *   When the adjustments leave nothing to bill.
+   */
+  private function forThePeriod(array $lines, OrderInterface $order, int $months): array {
+    $months = max(1, $months);
+    $currency = (string) $lines[0]['price_data']['currency'];
+
+    // The order's own adjustments, for the period. Those of the lines are in
+    // the adjusted unit price already, and an included one is in the price
+    // it was included in.
+    $adjustment = 0;
+
+    foreach ($order->getAdjustments() as $candidate) {
+      $amount = $candidate->getAmount();
+
+      if ($candidate->isIncluded() || strtolower($amount->getCurrencyCode()) !== $currency) {
+        continue;
+      }
+
+      $adjustment += $this->minorUnitsConverter->toMinorUnits($amount);
+    }
+
+    $adjustment *= $months;
+
+    $units = [];
+    $whole = 0;
+
+    foreach ($lines as $index => $line) {
+      $units[$index] = (int) $line['price_data']['unit_amount'] * $months;
+      $whole += $units[$index] * (int) $line['quantity'];
+    }
+
+    if ($adjustment !== 0) {
+      $owed = $whole + $adjustment;
+
+      // A discount as large as the order: Stripe refuses a price of nothing,
+      // and a subscription that collects nothing is not one.
+      if ($owed <= 0 || $whole <= 0) {
+        throw new PaymentGatewayException('There is nothing on this order that Stripe can bill.');
+      }
+
+      foreach ($units as $index => $unit) {
+        // Never to nothing: a line that is on the order at a price is billed
+        // at one.
+        $units[$index] = max(1, $unit + self::shareOf($adjustment, $unit, $whole));
+        $owed -= $units[$index] * (int) $lines[$index]['quantity'];
+      }
+
+      // What rounding left, a cent or two, on the lines that can take it: a
+      // line moves by its quantity, so the largest quantities go first and a
+      // line of one unit takes the rest.
+      $quantities = array_map(static fn (array $line): int => (int) $line['quantity'], $lines);
+      $byQuantity = array_keys($units);
+      usort($byQuantity, static fn (int $a, int $b): int => $quantities[$b] <=> $quantities[$a] ?: $a <=> $b);
+
+      foreach ($byQuantity as $index) {
+        $quantity = $quantities[$index];
+
+        if ($owed === 0) {
+          break;
+        }
+
+        if ($quantity < 1) {
+          continue;
+        }
+
+        $steps = intdiv(abs($owed), $quantity);
+        $steps = $owed < 0 ? min($steps, $units[$index] - 1) : $steps;
+        $change = $owed < 0 ? -$steps : $steps;
+
+        $units[$index] += $change;
+        $owed -= $change * $quantity;
+      }
+    }
+
+    foreach ($units as $index => $unit) {
+      $lines[$index]['price_data']['unit_amount'] = $unit;
+    }
+
+    return $lines;
+  }
+
+  /**
+   * A part's share of an amount, in proportion to the whole, rounded.
+   *
+   * In whole minor units throughout, halves away from zero as Commerce
+   * rounds, so the same order always comes to the same amounts.
+   */
+  private static function shareOf(int $amount, int $part, int $whole): int {
+    $product = $amount * $part;
+    $half = intdiv($whole, 2);
+
+    return $product < 0 ? -intdiv($half - $product, $whole) : intdiv($product + $half, $whole);
+  }
+
+  /**
+   * The days of trial an order's subscription starts with.
+   *
+   * The order's own, where it has one: a trial is decided per customer, and
+   * the gateway's setting is only what applies to everybody else.
+   */
+  private function trialOf(OrderInterface $order): int {
+    $own = $order->getData(self::TRIAL_KEY);
+
+    return max(0, (int) ($own ?? $this->configuration['trial_days'] ?? 0));
+  }
+
+  /**
+   * What a checkout of this order would be opened for, as one value.
+   *
+   * The lines Stripe would be sent, each with its currency, amount,
+   * quantity, name and recurrence, and the days of trial. A checkout carries
+   * the value it was opened with (Conventions::$contentsMetadataKey), on the
+   * session and on the subscription it makes, and Stripe copies the
+   * subscription's onto every invoice. Computed again from the order when
+   * the checkout comes back, it says whether the order still holds what the
+   * customer was shown and paid for.
+   *
+   * Nothing is kept on the order, so nothing has to be cleared when the
+   * order changes. Read from the order as it is stored: a caller holding an
+   * older copy reloads it first.
+   *
+   * @param \Drupal\commerce_order\Entity\OrderInterface $order
+   *   The order.
+   * @param bool $recurring
+   *   FALSE for a one-off payment (createPaymentCheckoutSession()).
+   *
+   * @return string
+   *   The value. An order with nothing to bill has one too, which no
+   *   checkout was ever opened with.
+   */
+  public function contentsOf(OrderInterface $order, bool $recurring = TRUE): string {
+    try {
+      $lines = $this->lineItems($order, $recurring);
+    }
+    catch (PaymentGatewayException) {
+      $lines = [];
+    }
+
+    return self::digestOf($lines, $recurring ? $this->trialOf($order) : 0);
+  }
+
+  /**
+   * Whether a Stripe object was opened for the order as it stands now.
+   *
+   * For a Checkout session, a subscription, or an invoice of one. FALSE also
+   * when the object does not say what it was opened for.
+   */
+  public function openedFor(OrderInterface $order, object $object): bool {
+    $claimed = $this->conventions->contentsClaimedBy($object);
+    $recurring = ($object->mode ?? 'subscription') !== 'payment';
+
+    return $claimed !== '' && hash_equals($this->contentsOf($order, $recurring), $claimed);
+  }
+
+  /**
+   * One value for a list of lines and a trial.
+   *
+   * A list rather than a set: two lines alike count twice. Sorted, so the
+   * order of the lines is not a difference.
+   *
+   * @param array<int, array<string, mixed>> $lines
+   *   Lines as lineItems() builds them.
+   * @param int $trial
+   *   Days of trial.
+   */
+  private static function digestOf(array $lines, int $trial): string {
+    $entries = [];
+
+    foreach ($lines as $line) {
+      $price = $line['price_data'] ?? [];
+      $recurring = $price['recurring'] ?? [];
+
+      $entries[] = json_encode([
+        (string) ($price['currency'] ?? ''),
+        (int) ($price['unit_amount'] ?? 0),
+        (int) ($line['quantity'] ?? 0),
+        (string) ($price['product_data']['name'] ?? ''),
+        (string) ($recurring['interval'] ?? ''),
+        (int) ($recurring['interval_count'] ?? 0),
+      ], JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE);
+    }
+
+    sort($entries, SORT_STRING);
+
+    return hash('sha256', implode("\n", $entries) . "\n" . 'trial:' . max(0, $trial));
+  }
+
+  /**
+   * Closes the checkout the order was sent to before, where it can be.
+   *
+   * A courtesy to the customer, who should have one page that can take
+   * their money, and not what keeps an older checkout from placing the
+   * order: that is the comparison with what it was opened for. So a Stripe
+   * that will not answer does not stop the next checkout from opening.
+   */
+  private function closeEarlierSession(OrderInterface $order): void {
+    try {
+      $this->expireCheckoutSession($order);
+    }
+    catch (PaymentGatewayException) {
+      // Still open, perhaps. Whatever it goes on to pay for is compared.
+    }
   }
 
   /**
@@ -1216,8 +1486,23 @@ final class StripeSubscription extends OffsitePaymentGatewayBase implements Recu
       throw new PaymentGatewayException(sprintf('Stripe would not say what happened to that checkout: %s', $e->getMessage()), 0, $e);
     }
 
+    // Open or expired: the customer did not finish it, whatever brought
+    // them to this address.
+    if (($session->status ?? NULL) !== 'complete') {
+      throw new PaymentGatewayException('That checkout was not completed at Stripe.');
+    }
+
     if (($session->subscription ?? NULL) === NULL) {
       throw new PaymentGatewayException('Stripe finished that checkout without creating a subscription.');
+    }
+
+    // Commerce places the order once this returns. A checkout opened for
+    // other lines or another trial than the order now holds does not place
+    // it: the customer is sent back to review what the order says. An order
+    // already placed was compared by whichever leg placed it, and may have
+    // been revised since.
+    if ($order->getState()->getId() === 'draft' && !$this->openedFor($order, $session)) {
+      throw new PaymentGatewayException('That checkout was not opened for what the order now holds. The order was not placed.');
     }
 
     // Learned here and nowhere else. Stripe makes the customer during the
@@ -1232,6 +1517,20 @@ final class StripeSubscription extends OffsitePaymentGatewayBase implements Recu
         $locked->setData(self::CUSTOMER_KEY, $customer);
       }
     });
+  }
+
+  /**
+   * {@inheritdoc}
+   *
+   * The customer came back without paying. The checkout they left stays
+   * payable at Stripe for a day unless it is closed, so it is closed. The
+   * order goes on naming it: the next checkout to open closes it again if
+   * Stripe did not answer this time, which costs nothing when it did.
+   */
+  public function onCancel(OrderInterface $order, Request $request): void {
+    $this->closeEarlierSession($order);
+
+    parent::onCancel($order, $request);
   }
 
   /**
@@ -1343,7 +1642,11 @@ final class StripeSubscription extends OffsitePaymentGatewayBase implements Recu
    */
   public function createPaymentCheckoutSession(OrderInterface $order, string $returnUrl, string $cancelUrl): CheckoutSession {
     $lines = $this->lineItems($order, FALSE);
-    $metadata = $this->metadata($order);
+    // With what it was opened for, as a subscription's checkout has: the
+    // site compares it before granting anything (openedFor()).
+    $metadata = $this->metadata($order) + [
+      $this->conventions->contentsMetadataKey => self::digestOf($lines, 0),
+    ];
 
     $parameters = [
       'mode' => 'payment',
@@ -1367,6 +1670,8 @@ final class StripeSubscription extends OffsitePaymentGatewayBase implements Recu
         $parameters['customer_email'] = $email;
       }
     }
+
+    $this->closeEarlierSession($order);
 
     try {
       $session = $this->stripe()->checkout->sessions->create($parameters);
@@ -1395,9 +1700,10 @@ final class StripeSubscription extends OffsitePaymentGatewayBase implements Recu
     }
 
     $items = [];
+    $lines = $this->lineItems($order);
 
     try {
-      foreach ($this->lineItems($order) as $line) {
+      foreach ($lines as $line) {
         $product = $this->stripe()->products->create(['name' => $line['price_data']['product_data']['name']]);
         $items[] = [
           'quantity' => $line['quantity'],
@@ -1415,7 +1721,11 @@ final class StripeSubscription extends OffsitePaymentGatewayBase implements Recu
         'collection_method' => 'send_invoice',
         'days_until_due' => $daysUntilDue,
         'items' => $items,
-        'metadata' => $this->metadata($order),
+        // With what it was started for, as a checkout has: an invoice paid
+        // weeks later places the order only while the order still holds it.
+        'metadata' => $this->metadata($order) + [
+          $this->conventions->contentsMetadataKey => self::digestOf($lines, $this->trialOf($order)),
+        ],
       ]);
     }
     catch (ApiErrorException $e) {

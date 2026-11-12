@@ -118,7 +118,44 @@ final class ConventionsTest extends KernelTestBase {
 
     // An empty value for a name that is written somewhere is no name.
     $this->assertSame(Conventions::DEFAULTS['line_metadata_key'], (new Conventions(['line_metadata_key' => '']))->lineMetadataKey);
+    $this->assertSame('csr_contents', (new Conventions(['contents_metadata_key' => '']))->contentsMetadataKey);
     $this->assertSame('uuid', (new Conventions(['owner_value' => 'anything']))->ownerValue);
+  }
+
+  /**
+   * A line's price is the amount of one charge unless the site says a month.
+   */
+  public function testPricesAreForOneChargeUnlessTheSiteSaysMonth(): void {
+    $this->assertFalse($this->container->get('commerce_stripe_recurring.conventions')->monthlyPrices, 'Prices became monthly without the site saying so.');
+    $this->assertFalse((new Conventions())->monthlyPrices);
+
+    // As services.yml or a service provider would give it.
+    foreach ([TRUE, 'true', 1, '1'] as $said) {
+      $this->assertTrue((new Conventions(['monthly_prices' => $said]))->monthlyPrices);
+    }
+    foreach ([FALSE, 'false', 0, '', NULL] as $said) {
+      $this->assertFalse((new Conventions(['monthly_prices' => $said]))->monthlyPrices);
+    }
+  }
+
+  /**
+   * What a checkout was opened for is read wherever Stripe carries it.
+   */
+  public function testWhatCheckoutWasOpenedForIsReadWhereStripeCarriesIt(): void {
+    $conventions = new Conventions(['contents_metadata_key' => 'shop_contents']);
+    $places = [
+      'own' => ['metadata' => ['shop_contents' => 'abc']],
+      'invoice' => ['parent' => ['subscription_details' => ['metadata' => ['shop_contents' => 'abc']]]],
+      'invoice, before 2025' => ['subscription_details' => ['metadata' => ['shop_contents' => 'abc']]],
+    ];
+
+    foreach ($places as $place => $shape) {
+      $this->assertSame('abc', $conventions->contentsClaimedBy(StripeObject::constructFrom($shape)), $place);
+    }
+
+    $this->assertSame('', $conventions->contentsClaimedBy(StripeObject::constructFrom(['metadata' => ['order_id' => '42']])));
+    $this->assertSame('', $conventions->contentsClaimedBy(StripeObject::constructFrom(['id' => 'cus_1'])));
+    $this->assertSame('', (new Conventions())->contentsClaimedBy(StripeObject::constructFrom(['metadata' => ['shop_contents' => 'abc']])));
   }
 
   /**

@@ -60,6 +60,21 @@ final class FakeStripe extends StripeClient {
    */
   public ?string $sessionCustomer = NULL;
 
+  /**
+   * The status a checkout session's `retrieve()` answers with.
+   */
+  public string $sessionStatus = 'complete';
+
+  /**
+   * The metadata a checkout session's `retrieve()` answers with.
+   *
+   * What the last `create()` was sent, as Stripe keeps it, unless a test
+   * puts its own here afterwards.
+   *
+   * @var array<string, string>
+   */
+  public array $sessionMetadata = [];
+
   public function __construct() {
     parent::__construct(['api_key' => 'sk_test_fake']);
   }

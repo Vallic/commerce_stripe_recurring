@@ -12,6 +12,7 @@ use Drupal\commerce_payment\Exception\PaymentGatewayException;
 use Drupal\commerce_price\Entity\Currency;
 use Drupal\commerce_price\Price;
 use Drupal\commerce_store\Entity\Store;
+use Drupal\commerce_stripe_recurring\Conventions;
 use Drupal\commerce_store\Entity\StoreType;
 use Drupal\commerce_stripe_recurring\Plugin\Commerce\PaymentGateway\StripeSubscription;
 use Drupal\KernelTests\KernelTestBase;
@@ -280,6 +281,47 @@ final class SubscriptionRevisionTest extends KernelTestBase {
   }
 
   /**
+   * Where prices are for one month, a revision bills the period as well.
+   *
+   * The checkout, a revision and the comparison read the same lines. A
+   * subscription that carries one month's amount a quarter no longer
+   * matches, and is replaced by one that carries the quarter's.
+   */
+  public function testMonthlyPricesAreRevisedForThePeriod(): void {
+    $monthly = ['monthly_prices' => TRUE];
+    $order = $this->order([['Plan S', '10.00', 1]]);
+    $order->setData(StripeSubscription::INTERVAL_KEY, 3)->save();
+
+    $this->remote([
+      $this->item('si_1', 'Plan S', 3000, 1, signature: $this->signature('Plan S', 3000, 3), months: 3),
+    ]);
+
+    $this->assertTrue($this->gateway($monthly)->revisionApplied($order), 'The quarter\'s amount was not recognized as the order\'s.');
+    $this->assertFalse($this->gateway($monthly)->reviseSubscription($order), 'A subscription that already bills the quarter was changed.');
+    // Said the other way round: a site that does not price by the month
+    // reads the same subscription as billing three times too much.
+    $this->assertFalse($this->gateway()->revisionApplied($order));
+
+    $this->remote([
+      $this->item('si_1', 'Plan S', 1000, 1, signature: $this->signature('Plan S', 1000, 3), months: 3),
+    ]);
+    $this->stripe->priceIds = ['price_quarter'];
+
+    $this->assertFalse($this->gateway($monthly)->revisionApplied($order), 'One month\'s amount a quarter was read as the order\'s.');
+    $this->assertTrue($this->gateway($monthly)->reviseSubscription($order));
+
+    $created = $this->stripe->call('prices', 'create');
+    $this->assertNotNull($created);
+    $this->assertSame(3000, $created[0]['unit_amount']);
+    $this->assertSame(['interval' => 'month', 'interval_count' => 3], $created[0]['recurring']);
+
+    $items = $this->sentItems();
+    $this->assertSame(['id' => 'si_1', 'deleted' => TRUE], $items[0]);
+    $this->assertSame('price_quarter', $items[1]['price']);
+    $this->assertSame($this->signature('Plan S', 3000, 3), $items[1]['metadata']['csr_line']);
+  }
+
+  /**
    * The customer is credited and charged for the part-period, every time.
    *
    * Left to Stripe's default, a change would bill from the next period and
@@ -368,7 +410,7 @@ final class SubscriptionRevisionTest extends KernelTestBase {
   /**
    * A Stripe subscription item, as the API describes one.
    */
-  private function item(string $id, string $name, int $amount, int $quantity, string $signature = ''): StripeObject {
+  private function item(string $id, string $name, int $amount, int $quantity, string $signature = '', int $months = 1): StripeObject {
     return StripeObject::constructFrom([
       'id' => $id,
       'quantity' => $quantity,
@@ -376,7 +418,7 @@ final class SubscriptionRevisionTest extends KernelTestBase {
       'price' => [
         'currency' => 'eur',
         'unit_amount' => $amount,
-        'recurring' => ['interval' => 'month', 'interval_count' => 1],
+        'recurring' => ['interval' => 'month', 'interval_count' => $months],
         'product' => ['name' => $name],
       ],
     ]);
@@ -388,8 +430,8 @@ final class SubscriptionRevisionTest extends KernelTestBase {
    * Built the way the gateway builds it rather than copied, so a change to
    * the format shows up as a failure here instead of as silent churn.
    */
-  private function signature(string $name, int $amount): string {
-    return sprintf('eur:%d:month:1:%s', $amount, $name);
+  private function signature(string $name, int $amount, int $months = 1): string {
+    return sprintf('eur:%d:month:%d:%s', $amount, $months, $name);
   }
 
   /**
@@ -401,8 +443,11 @@ final class SubscriptionRevisionTest extends KernelTestBase {
 
   /**
    * The gateway, built without its plugin machinery and wired to the fake.
+   *
+   * @param array<string, mixed> $conventions
+   *   The site's conventions; none for the container's.
    */
-  private function gateway(): StripeSubscription {
+  private function gateway(array $conventions = []): StripeSubscription {
     $reflection = new \ReflectionClass(StripeSubscription::class);
 
     /** @var \Drupal\commerce_stripe_recurring\Plugin\Commerce\PaymentGateway\StripeSubscription $plugin */
@@ -415,7 +460,7 @@ final class SubscriptionRevisionTest extends KernelTestBase {
     $reflection->getProperty('stripe')->setValue($plugin, $this->stripe);
 
     $reflection->getProperty('conventions')
-      ->setValue($plugin, $this->container->get('commerce_stripe_recurring.conventions'));
+      ->setValue($plugin, $conventions === [] ? $this->container->get('commerce_stripe_recurring.conventions') : new Conventions($conventions));
     $reflection->getProperty('orderLock')
       ->setValue($plugin, $this->container->get('commerce_stripe_recurring.order_lock'));
 

@@ -20,6 +20,7 @@ use Drupal\commerce_stripe_recurring\RenewalOrders;
 use Drupal\commerce_stripe_recurring_webhook\Controller\WebhookController;
 use Drupal\commerce_stripe_recurring_webhook\Event\WebhookEvent;
 use Drupal\KernelTests\KernelTestBase;
+use Drupal\Tests\commerce_stripe_recurring\Kernel\FakeStripe;
 use Drupal\user\Entity\User;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\RunTestsInSeparateProcesses;
@@ -262,6 +263,106 @@ final class WebhookEventsTest extends KernelTestBase {
   }
 
   /**
+   * A checkout opened for the order as it stands places and settles it.
+   *
+   * The same order, checkout and invoice as the tests below, with nothing
+   * changed in between.
+   */
+  public function testCheckoutOpenedForTheOrderPlacesIt(): void {
+    $order = $this->contract(state: 'draft', subscription: NULL);
+    $metadata = $this->openCheckout($order);
+
+    $this->assertTrue($this->body($this->post($this->checkout((int) $order->id(), $metadata)))['handled']);
+    $this->assertSame('sub_new', (string) $this->reload($order->id())->getData(StripeSubscription::SUBSCRIPTION_KEY));
+
+    $response = $this->post($this->event('invoice.paid', $this->invoice('in_first', (int) $order->id(), $metadata, 'sub_new')));
+
+    $this->assertTrue($this->body($response)['handled']);
+    $order = $this->reload($order->id());
+    $this->assertSame('completed', $order->getState()->getId());
+    $this->assertSame('in_first', (string) $order->getData(RenewalOrders::INVOICE_KEY));
+    $this->assertSame(12.5, (float) $order->getTotalPaid()->getNumber());
+    $this->assertCount(1, $this->paymentsFor($order->id()));
+    $this->assertNull($order->getData(StripeSubscription::MISMATCH_KEY));
+  }
+
+  /**
+   * An order that changed after its checkout was opened is not placed by it.
+   *
+   * The checkout bills what the customer was shown: Plan S at 12.50. The
+   * order has since come to hold Plan L at 400.00, and is not what was paid
+   * for. It stays a draft, nothing is recorded as paid, the checkout's
+   * subscription does not become the order's, and it is listed to be
+   * cancelled and refunded.
+   */
+  public function testCheckoutOpenedForOtherLinesDoesNotPlaceTheOrder(): void {
+    $order = $this->contract(state: 'draft', subscription: NULL);
+    $metadata = $this->openCheckout($order);
+
+    $order = $this->reload($order->id());
+    foreach ($order->getItems() as $item) {
+      $order->removeItem($item);
+      $item->delete();
+    }
+    $larger = OrderItem::create(['type' => 'default', 'quantity' => 1]);
+    $larger->setUnitPrice(new Price('400.00', 'EUR'), TRUE);
+    $larger->setTitle('Plan L — monthly', TRUE);
+    $larger->save();
+    $order->addItem($larger)->save();
+
+    $this->assertFalse($this->body($this->post($this->checkout((int) $order->id(), $metadata)))['handled']);
+    $response = $this->post($this->event('invoice.paid', $this->invoice('in_first', (int) $order->id(), $metadata, 'sub_new')));
+
+    $this->assertSame(200, $response->getStatusCode(), 'Stripe would retry this for ever.');
+    $this->assertFalse($this->body($response)['handled']);
+    $order = $this->reload($order->id());
+    $this->assertSame('draft', $order->getState()->getId(), 'An order was placed by a checkout opened for other lines.');
+    $this->assertCount(0, $this->paymentsFor($order->id()));
+    $this->assertSame('', (string) $order->getData(RenewalOrders::INVOICE_KEY));
+    $this->assertSame('', (string) $order->getData(StripeSubscription::SUBSCRIPTION_KEY), 'The checkout\'s subscription became the order\'s.');
+    $this->assertSame(['sub_new'], $order->getData(StripeSubscription::MISMATCH_KEY));
+
+    // An invoice that is no invoice places a draft order too, and not this.
+    $object = ['object' => 'charge', 'id' => 'ch_1', 'metadata' => $metadata];
+    $this->assertFalse($this->body($this->post($this->event('invoice.paid', $object)))['handled']);
+    $this->assertSame('draft', $this->reload($order->id())->getState()->getId());
+  }
+
+  /**
+   * Nor is an order whose trial was taken away after the checkout opened.
+   *
+   * The checkout carries three days of trial and collects nothing at the
+   * start; the order now says there is none.
+   */
+  public function testCheckoutOpenedWithAnotherTrialDoesNotPlaceTheOrder(): void {
+    $order = $this->contract(state: 'draft', subscription: NULL);
+    $order->setData(StripeSubscription::TRIAL_KEY, 3)->save();
+    $metadata = $this->openCheckout($order);
+
+    $order = $this->reload($order->id());
+    $order->unsetData(StripeSubscription::TRIAL_KEY)->save();
+
+    $zero = $this->invoice('in_trial', (int) $order->id(), $metadata, 'sub_new');
+    $zero['amount_paid'] = 0;
+
+    $this->assertFalse($this->body($this->post($this->event('invoice.paid', $zero)))['handled']);
+    $order = $this->reload($order->id());
+    $this->assertSame('draft', $order->getState()->getId(), 'An order was placed by a checkout that carried a trial it no longer has.');
+    $this->assertCount(0, $this->paymentsFor($order->id()));
+    $this->assertSame('', (string) $order->getData(RenewalOrders::INVOICE_KEY));
+    $this->assertSame(['sub_new'], $order->getData(StripeSubscription::MISMATCH_KEY));
+
+    // With its trial, the same invoice starts it: placed, nothing recorded.
+    $trial = $this->contract(state: 'draft', subscription: NULL);
+    $trial->setData(StripeSubscription::TRIAL_KEY, 3)->save();
+    $kept = $this->invoice('in_trial_kept', (int) $trial->id(), $this->openCheckout($trial), 'sub_trial');
+    $kept['amount_paid'] = 0;
+
+    $this->assertTrue($this->body($this->post($this->event('invoice.paid', $kept)))['handled']);
+    $this->assertSame('completed', $this->reload($trial->id())->getState()->getId());
+  }
+
+  /**
    * A signed event typed as an invoice that is not one still places a draft.
    *
    * The event is authentic; a paid order left in draft is worse than one left
@@ -462,26 +563,76 @@ final class WebhookEventsTest extends KernelTestBase {
   /**
    * A checkout session that finished, for an order.
    *
+   * @param int $order
+   *   The order's id.
+   * @param array<string, string> $metadata
+   *   The session's metadata, as createCheckoutSession() sent it.
+   *
    * @return array<string, mixed>
    *   The event.
    */
-  private function checkout(int $order): array {
+  private function checkout(int $order, array $metadata = []): array {
     return $this->event('checkout.session.completed', [
       'object' => 'checkout.session',
       'id' => 'cs_test',
+      'mode' => 'subscription',
       'client_reference_id' => (string) $order,
       'subscription' => 'sub_new',
       'customer' => 'cus_new',
-    ]);
+    ] + ($metadata === [] ? [] : ['metadata' => $metadata]));
+  }
+
+  /**
+   * Opens the order's checkout through the gateway, against a fake Stripe.
+   *
+   * @return array<string, string>
+   *   The metadata the subscription was given, which Stripe copies onto
+   *   every invoice of it.
+   */
+  private function openCheckout(Order $order): array {
+    $plugin = PaymentGateway::load('stripe_subscription')?->getPlugin();
+    $this->assertInstanceOf(StripeSubscription::class, $plugin);
+    $stripe = new FakeStripe();
+    (new \ReflectionProperty($plugin, 'stripe'))->setValue($plugin, $stripe);
+
+    $plugin->createCheckoutSession($order, 'https://example.test/back', 'https://example.test/cancel');
+
+    $sent = $stripe->call('checkout.sessions', 'create');
+    $this->assertNotNull($sent);
+    $this->assertSame($sent[0]['metadata'], $sent[0]['subscription_data']['metadata']);
+
+    return $sent[0]['subscription_data']['metadata'];
+  }
+
+  /**
+   * The payments recorded against an order.
+   *
+   * @return array<int, \Drupal\Core\Entity\EntityInterface>
+   *   The payments.
+   */
+  private function paymentsFor(int|string $id): array {
+    return $this->container->get('entity_type.manager')
+      ->getStorage('commerce_payment')
+      ->loadByProperties(['order_id' => $id]);
   }
 
   /**
    * A paid invoice for one period, naming its order as Stripe does.
    *
+   * @param string $id
+   *   The invoice's id.
+   * @param int $order
+   *   The order's id.
+   * @param array<string, string>|null $metadata
+   *   The subscription's metadata as the invoice carries it; the order alone
+   *   by default.
+   * @param string $subscription
+   *   The subscription the invoice is of.
+   *
    * @return array<string, mixed>
    *   The invoice.
    */
-  private function invoice(string $id, int $order): array {
+  private function invoice(string $id, int $order, ?array $metadata = NULL, string $subscription = 'sub_existing'): array {
     return [
       'object' => 'invoice',
       'id' => $id,
@@ -500,8 +651,8 @@ final class WebhookEventsTest extends KernelTestBase {
       ],
       'parent' => [
         'subscription_details' => [
-          'subscription' => 'sub_existing',
-          'metadata' => ['order_id' => (string) $order],
+          'subscription' => $subscription,
+          'metadata' => $metadata ?? ['order_id' => (string) $order],
         ],
       ],
     ];

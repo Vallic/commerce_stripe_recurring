@@ -6,6 +6,7 @@ namespace Drupal\commerce_stripe_recurring;
 
 use Drupal\Core\Entity\EntityTypeManagerInterface;
 use Drupal\commerce_order\Entity\OrderInterface;
+use Drupal\commerce_payment\Entity\PaymentGatewayInterface;
 use Drupal\commerce_stripe_recurring\Plugin\Commerce\PaymentGateway\StripeSubscription;
 use Psr\Log\LoggerInterface;
 use Stripe\Invoice;
@@ -20,6 +21,11 @@ use Stripe\Invoice;
  * right about cards and wrong about every bank debit. So the order follows
  * the invoice, not the checkout: it is placed and paid on `invoice.paid` and
  * on nothing else.
+ *
+ * And only by a checkout opened for what the order holds. A checkout shows
+ * the customer lines and a trial, and bills those; an order that has changed
+ * since is not the order that was paid for, and no event of that checkout
+ * places it (heldBack()).
  *
  * The event arrives already verified: by this project's webhook submodule,
  * or by a site's own endpoint that stores events before handling them. This
@@ -46,8 +52,9 @@ final readonly class OrderEvents {
    *   The event's `created` time, the fallback for when a subscription ended.
    *
    * @return bool
-   *   Whether the event changed anything. Never an error: a replay, an event
-   *   about nothing of ours and an event this ignores all answer FALSE.
+   *   Whether the event was applied. Never an error: a replay, an event
+   *   about nothing of ours, an event this ignores and an event of a checkout
+   *   opened for something else than its order now holds all answer FALSE.
    */
   public function handle(string $type, object $object, ?int $occurred = NULL): bool {
     $dispatch = fn(): bool => match ($type) {
@@ -90,6 +97,13 @@ final readonly class OrderEvents {
     $order = $this->orderOf($session);
 
     if ($order === NULL) {
+      return FALSE;
+    }
+
+    // The subscription of a checkout opened for something else is not the
+    // order's: adopted, it would turn away the events of the checkout that
+    // does pay for what the order holds.
+    if ($this->heldBack($order, $session)) {
       return FALSE;
     }
 
@@ -139,6 +153,11 @@ final readonly class OrderEvents {
 
     // A subscription the platform cancelled as a duplicate is never placed.
     if ((string) $order->getData($this->conventions->duplicateKey) !== '') {
+      return FALSE;
+    }
+
+    // Before any of the three ways below places a draft order.
+    if ($this->heldBack($order, $invoice)) {
       return FALSE;
     }
 
@@ -256,6 +275,78 @@ final readonly class OrderEvents {
   }
 
   /**
+   * Whether an event is of a checkout opened for something else.
+   *
+   * Asked of a draft order only, before anything places it or records a
+   * subscription on it. An order already placed was compared by whichever
+   * leg placed it, and is revised afterwards as a matter of course.
+   *
+   * The object says what its checkout was opened for
+   * (Conventions::contentsClaimedBy()), and the order's gateway says what a
+   * checkout of the order would be opened for now
+   * (StripeSubscription::contentsOf()). Where the two differ the order has
+   * changed since the customer was shown it, and what Stripe collects is not
+   * what the order says. Then nothing is placed and nothing recorded as
+   * paid; the subscription is listed on the order
+   * (StripeSubscription::MISMATCH_KEY) and the log says so, because money
+   * may have moved and somebody has to cancel and refund it.
+   *
+   * An object that says nothing is held back where the order was sent to a
+   * checkout: every checkout opened since this comparison exists says what
+   * it was opened for, and one from before lives a day at most. Where the
+   * order was never sent to one, the subscription was made some other way
+   * and the event is applied as it always was.
+   */
+  private function heldBack(OrderInterface $order, object $object): bool {
+    if ($order->getState()->getId() !== 'draft') {
+      return FALSE;
+    }
+
+    $claimed = $this->conventions->contentsClaimedBy($object);
+
+    if ($claimed === '') {
+      if ((string) $order->getData(StripeSubscription::SESSION_KEY) === '') {
+        return FALSE;
+      }
+
+      $why = 'does not say what its checkout was opened for';
+    }
+    else {
+      $gateway = $order->hasField('payment_gateway') ? $order->get('payment_gateway')->entity : NULL;
+      $plugin = $gateway instanceof PaymentGatewayInterface ? $gateway->getPlugin() : NULL;
+
+      if ($plugin instanceof StripeSubscription) {
+        if ($plugin->openedFor($order, $object)) {
+          return FALSE;
+        }
+
+        $why = 'is of a checkout opened for other lines or another trial than the order now holds';
+      }
+      else {
+        // Nothing to compute the order's side with. Not placed on trust.
+        $why = 'cannot be compared: the order does not name the Stripe gateway that opened its checkout';
+      }
+    }
+
+    $stray = $this->subscriptionIn($object) ?: (string) ($object->id ?? '');
+    $listed = array_values(array_filter((array) $order->getData(StripeSubscription::MISMATCH_KEY, []), is_string(...)));
+
+    if ($stray !== '' && !in_array($stray, $listed, TRUE)) {
+      $listed[] = $stray;
+      $order->setData(StripeSubscription::MISMATCH_KEY, $listed);
+      $order->save();
+    }
+
+    $this->logger->error('A Stripe event for draft order @id @why. The order was not placed and no payment was recorded. If @stray collected money, it is to be cancelled and refunded.', [
+      '@id' => $order->id(),
+      '@why' => $why,
+      '@stray' => $stray === '' ? 'it' : $stray,
+    ]);
+
+    return TRUE;
+  }
+
+  /**
    * The order a Stripe object belongs to.
    *
    * By the metadata the checkout put there, in the three places it surfaces:
@@ -319,10 +410,7 @@ final readonly class OrderEvents {
    * refused and logged.
    */
   private function consistent(OrderInterface $order, object $object): bool {
-    $subscription = $object->parent->subscription_details->subscription
-      ?? $object->subscription
-      ?? (str_starts_with((string) ($object->id ?? ''), 'sub_') ? $object->id : NULL);
-    $subscription = $this->idOf($subscription);
+    $subscription = $this->subscriptionIn($object);
     $customer = $this->idOf($object->customer ?? NULL);
     $recordedSubscription = (string) $order->getData(StripeSubscription::SUBSCRIPTION_KEY);
     $recordedCustomer = (string) $order->getData(StripeSubscription::CUSTOMER_KEY);
@@ -335,6 +423,17 @@ final readonly class OrderEvents {
     }
 
     return TRUE;
+  }
+
+  /**
+   * The subscription a Stripe object is about; '' for none.
+   *
+   * An invoice's parent, a session's own, or the object itself.
+   */
+  private function subscriptionIn(object $object): string {
+    return $this->idOf($object->parent->subscription_details->subscription
+      ?? $object->subscription
+      ?? (str_starts_with((string) ($object->id ?? ''), 'sub_') ? $object->id : NULL));
   }
 
   /**

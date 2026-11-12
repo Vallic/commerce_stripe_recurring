@@ -234,11 +234,16 @@ interface RecurringGatewayInterface {
    *
    * That is `mode=subscription`.
    *
-   * Priced inline from the order's adjusted (tax-inclusive) unit prices, with
-   * `metadata{order_id}`, and the owner where the site names one
-   * (Conventions), on the session and on the subscription: a cross-check when
+   * Priced inline from the order's adjusted (tax-inclusive) unit prices, for
+   * the whole period where the site prices its orders for one month
+   * (Conventions), with `metadata{order_id}`, and the owner where the site
+   * names one, on the session and on the subscription: a cross-check when
    * an event comes back, never what decides whose the order is.
-   * The order records the session id.
+   *
+   * The metadata also says what the checkout was opened for, the lines and
+   * the trial as one value: a checkout places a draft order only while the
+   * order still holds that. The checkout the order was sent to before is
+   * expired, and the order records the new session's id.
    *
    * @param \Drupal\commerce_order\Entity\OrderInterface $order
    *   The subscription order.
@@ -259,10 +264,13 @@ interface RecurringGatewayInterface {
   /**
    * Opens the Checkout session of a one-off payment (`mode=payment`).
    *
-   * The session carries the same metadata as a subscription's. The order
-   * records the session id. Nothing should be granted until the session's
-   * `payment_status` is `paid` or its asynchronous payment succeeds: that is
-   * the site's to handle, from `checkout.session.completed` and
+   * The session carries the same metadata as a subscription's, what it was
+   * opened for included. The checkout the order was sent to before is
+   * expired, and the order records the new session's id. Nothing should be
+   * granted until the session's `payment_status` is `paid` or its
+   * asynchronous payment succeeds, and only while the order still holds what
+   * the session was opened for: that is the site's to handle, from
+   * `checkout.session.completed` and
    * `checkout.session.async_payment_succeeded`.
    *
    * @throws \Drupal\commerce_payment\Exception\PaymentGatewayException

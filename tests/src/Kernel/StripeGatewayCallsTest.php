@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Drupal\Tests\commerce_stripe_recurring\Kernel;
 
 use Drupal\Core\Form\FormState;
+use Drupal\commerce_order\Adjustment;
 use Drupal\commerce_order\Entity\Order;
 use Drupal\commerce_order\Entity\OrderItem;
 use Drupal\commerce_order\Entity\OrderItemType;
@@ -119,9 +120,14 @@ final class StripeGatewayCallsTest extends KernelTestBase {
     $this->assertSame('https://example.test/back', $sent['success_url']);
     $this->assertSame('https://example.test/cancel', $sent['cancel_url']);
     $this->assertSame((string) $order->id(), $sent['client_reference_id']);
-    // The order travels in both places a later event can name it from.
-    $this->assertSame(['order_id' => (string) $order->id()], $sent['metadata']);
-    $this->assertSame(['order_id' => (string) $order->id()], $sent['subscription_data']['metadata']);
+    // The order travels in both places a later event can name it from, with
+    // what the checkout was opened for.
+    $this->assertSame([
+      'order_id' => (string) $order->id(),
+      'csr_contents' => $this->gateway()->contentsOf($order),
+    ], $sent['metadata']);
+    $this->assertSame($sent['metadata'], $sent['subscription_data']['metadata']);
+    $this->assertMatchesRegularExpression('/^[0-9a-f]{64}$/', $sent['metadata']['csr_contents']);
     $this->assertSame('anna@example.test', $sent['customer_email']);
     $this->assertArrayNotHasKey('customer', $sent);
     $this->assertArrayNotHasKey('payment_method_types', $sent, 'Methods were restricted without being asked to be.');
@@ -153,16 +159,130 @@ final class StripeGatewayCallsTest extends KernelTestBase {
 
   /**
    * A period bought ahead is billed at its own interval, within a year.
+   *
+   * At the line's own price, which is the amount of one charge unless the
+   * site says its prices are for one month.
    */
   public function testPeriodBoughtAheadIsBilledAtItsInterval(): void {
     foreach ([3 => 3, 12 => 12, 24 => 12] as $months => $expected) {
       $order = $this->order([['Plan S', '30.00', 1]]);
+      // On the order, not on a line: not sent unless prices are monthly.
+      $order->addAdjustment($this->discount('-1.50'));
       $order->setData(StripeSubscription::INTERVAL_KEY, $months)->save();
 
       $this->gateway()->createCheckoutSession($order, 'https://example.test/back', 'https://example.test/cancel');
 
-      $this->assertSame($expected, $this->lastSent('checkout.sessions', 'create')['line_items'][0]['price_data']['recurring']['interval_count']);
+      $price = $this->lastSent('checkout.sessions', 'create')['line_items'][0]['price_data'];
+      $this->assertSame($expected, $price['recurring']['interval_count']);
+      $this->assertSame(3000, $price['unit_amount']);
     }
+  }
+
+  /**
+   * Where prices are for one month, a period is billed all of its months.
+   */
+  public function testMonthlyPricesAreBilledForThePeriod(): void {
+    $periods = [1 => [1, 3000], 3 => [3, 9000], 12 => [12, 36000], 24 => [12, 36000]];
+
+    foreach ($periods as $months => [$interval, $amount]) {
+      $order = $this->order([['Plan S', '30.00', 1]]);
+      $order->setData(StripeSubscription::INTERVAL_KEY, $months)->save();
+
+      $this->gateway(conventions: ['monthly_prices' => TRUE])->createCheckoutSession($order, 'https://example.test/back', 'https://example.test/cancel');
+
+      $price = $this->lastSent('checkout.sessions', 'create')['line_items'][0]['price_data'];
+      $this->assertSame($interval, $price['recurring']['interval_count']);
+      $this->assertSame($amount, $price['unit_amount'], sprintf('%d months of 30.00 were sent as %d.', $months, $price['unit_amount']));
+    }
+
+    // The gateway's own months, where the order says none.
+    $this->gateway(['interval_months' => 6], conventions: ['monthly_prices' => TRUE])
+      ->createCheckoutSession($this->order([['Plan S', '30.00', 1]]), 'https://example.test/back', 'https://example.test/cancel');
+    $this->assertSame(18000, $this->lastSent('checkout.sessions', 'create')['line_items'][0]['price_data']['unit_amount']);
+  }
+
+  /**
+   * A period collects the order's total times its months, discount and all.
+   *
+   * A discount for paying ahead is on the order, and Stripe is given lines
+   * only: each line takes its share.
+   */
+  public function testThePeriodCollectsTheOrdersTotalTimesItsMonths(): void {
+    $monthly = ['monthly_prices' => TRUE];
+    // Months, the discount, and what one line of 30.00 a month is sent as.
+    $cases = [[3, '-1.50', 8550], [12, '-4.50', 30600], [1, '-1.50', 2850]];
+
+    foreach ($cases as [$months, $discount, $amount]) {
+      $order = $this->order([['Plan S', '30.00', 1]]);
+      $order->addAdjustment($this->discount($discount));
+      $order->setData(StripeSubscription::INTERVAL_KEY, $months)->save();
+
+      $this->gateway(conventions: $monthly)->createCheckoutSession($order, 'https://example.test/back', 'https://example.test/cancel');
+
+      $lines = $this->lastSent('checkout.sessions', 'create')['line_items'];
+      $this->assertSame($amount, $lines[0]['price_data']['unit_amount']);
+      $this->assertSame($this->cents($order) * $months, $this->collected($lines), 'Stripe would not collect the order total times its months.');
+    }
+
+    // Several lines, one of them of two units, and a discount that does not
+    // divide: 5 % of 42.50 is 2.125, which the order rounds to 2.13. A
+    // quarter is three times 40.37, and the cent rounding leaves is on the
+    // line of one unit.
+    $order = $this->order([['Plan S', '12.50', 1], ['Extra bandwidth', '15.00', 2]]);
+    $order->addAdjustment($this->discount('-2.125'));
+    $order->setData(StripeSubscription::INTERVAL_KEY, 3)->save();
+    $this->assertSame(4037, $this->cents($order));
+
+    $this->gateway(conventions: $monthly)->createCheckoutSession($order, 'https://example.test/back', 'https://example.test/cancel');
+
+    $lines = $this->lastSent('checkout.sessions', 'create')['line_items'];
+    $this->assertSame([3563, 4274], array_map(static fn (array $line): int => $line['price_data']['unit_amount'], $lines));
+    $this->assertSame([1, 2], array_column($lines, 'quantity'));
+    $this->assertSame(12111, $this->collected($lines));
+
+    // An adjustment that adds, such as a fee, is shared the same way.
+    $order = $this->order([['Plan S', '10.00', 1], ['Backups', '30.00', 1]]);
+    $order->addAdjustment($this->discount('4.00'));
+    $order->setData(StripeSubscription::INTERVAL_KEY, 3)->save();
+
+    $this->gateway(conventions: $monthly)->createCheckoutSession($order, 'https://example.test/back', 'https://example.test/cancel');
+
+    $lines = $this->lastSent('checkout.sessions', 'create')['line_items'];
+    $this->assertSame([3300, 9900], array_map(static fn (array $line): int => $line['price_data']['unit_amount'], $lines));
+  }
+
+  /**
+   * A one-off payment has no months: it takes the order's adjustments only.
+   */
+  public function testOneOffPaymentOfMonthlyPricesIsNotMultiplied(): void {
+    $order = $this->order([['Credits 500', '30.00', 1]]);
+    $order->addAdjustment($this->discount('-1.50'));
+    $order->setData(StripeSubscription::INTERVAL_KEY, 3)->save();
+
+    $this->gateway(conventions: ['monthly_prices' => TRUE])->createPaymentCheckoutSession($order, 'https://example.test/back', 'https://example.test/cancel');
+
+    $sent = $this->lastSent('checkout.sessions', 'create');
+    $this->assertSame('payment', $sent['mode']);
+    $this->assertSame(2850, $sent['line_items'][0]['price_data']['unit_amount']);
+    $this->assertArrayNotHasKey('recurring', $sent['line_items'][0]['price_data']);
+  }
+
+  /**
+   * A discount as large as the order leaves nothing to bill.
+   */
+  public function testDiscountOfTheWholeOrderIsRefused(): void {
+    $order = $this->order([['Plan S', '30.00', 1]]);
+    $order->addAdjustment($this->discount('-30.00'));
+    $order->save();
+
+    try {
+      $this->gateway(conventions: ['monthly_prices' => TRUE])->createCheckoutSession($order, 'https://example.test/back', 'https://example.test/cancel');
+      $this->fail('An order that comes to nothing was sent to Stripe.');
+    }
+    catch (PaymentGatewayException $e) {
+      $this->assertStringContainsString('nothing on this order that Stripe can bill', $e->getMessage());
+    }
+    $this->assertSame(0, $this->stripe->countOf('checkout.sessions', 'create'));
   }
 
   /**
@@ -255,17 +375,162 @@ final class StripeGatewayCallsTest extends KernelTestBase {
    * The return leg records the subscription and the customer, not a payment.
    */
   public function testTheReturnRecordsTheSubscriptionAndCustomer(): void {
-    $order = $this->order([['Plan S', '12.50', 1]]);
-    $order->setData(StripeSubscription::SESSION_KEY, 'cs_test_made')->save();
+    $order = $this->order([['Plan S', '12.50', 1]], subscription: '', state: 'draft');
+    $this->gateway()->createCheckoutSession($order, 'https://example.test/back', 'https://example.test/cancel');
     $this->stripe->sessionSubscription = 'sub_new';
     $this->stripe->sessionCustomer = 'cus_new';
 
-    $this->gateway()->onReturn($order, Request::create('/back'));
+    $this->gateway()->onReturn($this->reload($order->id()), Request::create('/back'));
 
     $order = $this->reload($order->id());
     $this->assertSame('sub_new', (string) $order->getData(StripeSubscription::SUBSCRIPTION_KEY));
     $this->assertSame('cus_new', (string) $order->getData(StripeSubscription::CUSTOMER_KEY));
     $this->assertSame(['cs_test_made'], $this->sent('checkout.sessions', 'retrieve', all: TRUE));
+  }
+
+  /**
+   * A checkout opened for other lines than the order holds records nothing.
+   *
+   * Commerce places the order once the return leg is through, so the return
+   * leg is where an order that changed after its checkout was opened stops.
+   *
+   * @return array<string, array{string}>
+   *   What changed on the order after the checkout was opened.
+   */
+  public static function changesAfterTheCheckoutOpened(): array {
+    return [
+      'another line' => ['line'],
+      'another quantity' => ['quantity'],
+      'another period' => ['period'],
+      'another trial' => ['trial'],
+      'a checkout from before the comparison' => ['unsaid'],
+    ];
+  }
+
+  /**
+   * Each way the order and its checkout can come to disagree.
+   */
+  #[\PHPUnit\Framework\Attributes\DataProvider('changesAfterTheCheckoutOpened')]
+  public function testTheReturnOfCheckoutOpenedForSomethingElseRecordsNothing(string $change): void {
+    $order = $this->order([['Plan S', '12.50', 1]], subscription: '', state: 'draft');
+    $this->gateway()->createCheckoutSession($order, 'https://example.test/back', 'https://example.test/cancel');
+    $this->stripe->sessionSubscription = 'sub_x';
+    $this->stripe->sessionCustomer = 'cus_x';
+
+    $order = $this->reload($order->id());
+    $item = $order->getItems()[0];
+    match ($change) {
+      'line' => $item->setUnitPrice(new Price('400.00', 'EUR'), TRUE)->setTitle('Plan L', TRUE)->save(),
+      'quantity' => $item->setQuantity('3')->save(),
+      'period' => $order->setData(StripeSubscription::INTERVAL_KEY, 12),
+      'trial' => $order->setData(StripeSubscription::TRIAL_KEY, 30),
+      'unsaid' => $this->stripe->sessionMetadata = ['order_id' => (string) $order->id()],
+      default => throw new \LogicException('No such change: ' . $change),
+    };
+    $order->save();
+
+    try {
+      $this->gateway()->onReturn($this->reload($order->id()), Request::create('/back'));
+      $this->fail('A checkout opened for something else was taken as the order\'s.');
+    }
+    catch (PaymentGatewayException $e) {
+      $this->assertStringContainsString('not opened for what the order now holds', $e->getMessage());
+    }
+
+    $order = $this->reload($order->id());
+    $this->assertSame('', (string) $order->getData(StripeSubscription::SUBSCRIPTION_KEY));
+    $this->assertSame('', (string) $order->getData(StripeSubscription::CUSTOMER_KEY));
+  }
+
+  /**
+   * An order already placed is not compared: it is revised as it goes.
+   */
+  public function testTheReturnOfPlacedOrderIsNotCompared(): void {
+    $order = $this->order([['Plan S', '12.50', 1]], subscription: '');
+    $this->gateway()->createCheckoutSession($order, 'https://example.test/back', 'https://example.test/cancel');
+    $this->stripe->sessionSubscription = 'sub_new';
+
+    $order = $this->reload($order->id());
+    $order->getItems()[0]->setQuantity('2')->save();
+    $order->save();
+
+    $this->gateway()->onReturn($this->reload($order->id()), Request::create('/back'));
+
+    $this->assertSame('sub_new', (string) $this->reload($order->id())->getData(StripeSubscription::SUBSCRIPTION_KEY));
+  }
+
+  /**
+   * One open checkout: opening another closes the one before.
+   *
+   * And so does the customer coming back without paying. A Stripe that will
+   * not close it does not stop the next from opening.
+   */
+  public function testAnEarlierCheckoutIsClosed(): void {
+    $order = $this->order([['Plan S', '12.50', 1]], subscription: '', state: 'draft');
+
+    $this->gateway()->createCheckoutSession($order, 'https://example.test/back', 'https://example.test/cancel');
+    $this->assertSame(0, $this->stripe->countOf('checkout.sessions', 'expire'), 'There was no earlier checkout to close.');
+
+    $this->gateway()->createCheckoutSession($this->reload($order->id()), 'https://example.test/back', 'https://example.test/cancel');
+    $this->assertSame(['cs_test_made'], $this->stripe->call('checkout.sessions', 'expire'));
+    $this->assertSame(
+      ['create', 'expire', 'create'],
+      array_column(array_filter($this->stripe->calls, static fn (array $call): bool => $call[0] === 'checkout.sessions'), 1),
+      'The earlier checkout was not closed before the next was opened.',
+    );
+
+    $this->gateway()->onCancel($this->reload($order->id()), Request::create('/cancel'));
+    $this->assertSame(2, $this->stripe->countOf('checkout.sessions', 'expire'));
+
+    $this->stripe->failOn = 'checkout.sessions.expire';
+    $this->stripe->failCode = 'api_error';
+    $this->gateway()->onCancel($this->reload($order->id()), Request::create('/cancel'));
+    $this->stripe->failOn = NULL;
+    $this->gateway()->createPaymentCheckoutSession($this->reload($order->id()), 'https://example.test/back', 'https://example.test/cancel');
+    $this->assertSame(4, $this->stripe->countOf('checkout.sessions', 'expire'));
+    $this->assertSame(3, $this->stripe->countOf('checkout.sessions', 'create'));
+  }
+
+  /**
+   * What a checkout was opened for is one value, the same for the same order.
+   */
+  public function testWhatCheckoutIsOpenedForIsOneValue(): void {
+    $order = $this->order([['Plan S', '12.50', 1], ['Backups', '7.50', 1]]);
+    $same = $this->order([['Backups', '7.50', 1], ['Plan S', '12.50', 1]]);
+    $gateway = $this->gateway();
+
+    $this->assertSame($gateway->contentsOf($order), $gateway->contentsOf($same), 'The order of the lines was read as a difference.');
+
+    // Two lines alike are two lines.
+    $this->assertNotSame(
+      $gateway->contentsOf($this->order([['Disk', '5.00', 1]])),
+      $gateway->contentsOf($this->order([['Disk', '5.00', 1], ['Disk', '5.00', 1]])),
+    );
+    // The trial, the gateway's own included, and the kind of checkout.
+    $this->assertNotSame($gateway->contentsOf($order), $this->gateway(['trial_days' => 3])->contentsOf($order));
+    $this->assertNotSame($gateway->contentsOf($order), $gateway->contentsOf($order, FALSE));
+    // What the site says its prices are for.
+    $quarter = $this->order([['Plan S', '12.50', 1]]);
+    $quarter->setData(StripeSubscription::INTERVAL_KEY, 3)->save();
+    $monthly = $this->gateway(conventions: ['monthly_prices' => TRUE]);
+    $this->assertNotSame($gateway->contentsOf($quarter), $monthly->contentsOf($quarter));
+    // An order with nothing to bill has a value no checkout was opened with.
+    $free = $this->order([['Basic WAF', '0.00', 1]]);
+    $this->assertMatchesRegularExpression('/^[0-9a-f]{64}$/', $gateway->contentsOf($free));
+
+    // A one-off payment says what it was opened for too, on the session and
+    // on the payment intent.
+    $gateway->createPaymentCheckoutSession($order, 'https://example.test/back', 'https://example.test/cancel');
+    $sent = $this->lastSent('checkout.sessions', 'create');
+    $this->assertSame($gateway->contentsOf($order, FALSE), $sent['metadata']['csr_contents']);
+    $this->assertSame($sent['metadata'], $sent['payment_intent_data']['metadata']);
+    $session = static fn (string $mode, array $metadata): StripeObject => StripeObject::constructFrom([
+      'mode' => $mode,
+      'metadata' => $metadata,
+    ]);
+    $this->assertTrue($gateway->openedFor($order, $session('payment', $sent['metadata'])));
+    $this->assertFalse($gateway->openedFor($order, $session('subscription', $sent['metadata'])));
+    $this->assertFalse($gateway->openedFor($order, $session('payment', [])));
   }
 
   /**
@@ -279,6 +544,8 @@ final class StripeGatewayCallsTest extends KernelTestBase {
       'never sent' => ['never sent', 'never sent to Stripe'],
       'Stripe will not say' => ['refused', 'would not say what happened'],
       'no subscription made' => ['no subscription', 'without creating a subscription'],
+      'left open' => ['open', 'was not completed at Stripe'],
+      'expired' => ['expired', 'was not completed at Stripe'],
     ];
   }
 
@@ -294,6 +561,7 @@ final class StripeGatewayCallsTest extends KernelTestBase {
       'never sent' => $order->unsetData(StripeSubscription::SESSION_KEY)->save(),
       'refused' => $this->stripe->failOn = 'checkout.sessions.retrieve',
       'no subscription' => $this->stripe->sessionSubscription = NULL,
+      'open', 'expired' => $this->stripe->sessionStatus = $how,
       default => throw new \LogicException('No such way to break a return: ' . $how),
     };
 
@@ -368,7 +636,11 @@ final class StripeGatewayCallsTest extends KernelTestBase {
     $this->gateway(site: 'shop-a')->createCheckoutSession($order, 'https://example.test/back', 'https://example.test/cancel');
 
     $sent = $this->sent('checkout.sessions', 'create');
-    $expected = ['order_id' => (string) $order->id(), 'csr_site' => 'shop-a'];
+    $expected = [
+      'order_id' => (string) $order->id(),
+      'csr_site' => 'shop-a',
+      'csr_contents' => $this->gateway()->contentsOf($order),
+    ];
     $this->assertSame($expected, $sent['metadata']);
     $this->assertSame($expected, $sent['subscription_data']['metadata']);
   }
@@ -562,9 +834,11 @@ final class StripeGatewayCallsTest extends KernelTestBase {
    * @param array<string, mixed> $settings
    *   Settings over the defaults.
    * @param string $site
-   *   The site settings.php names, or '' for the container's conventions.
+   *   The site settings.php names, or '' for none.
+   * @param array<string, mixed> $conventions
+   *   The site's conventions. With neither these nor a site, the container's.
    */
-  private function gateway(array $settings = [], string $site = ''): StripeSubscription {
+  private function gateway(array $settings = [], string $site = '', array $conventions = []): StripeSubscription {
     $reflection = new \ReflectionClass(StripeSubscription::class);
 
     /** @var \Drupal\commerce_stripe_recurring\Plugin\Commerce\PaymentGateway\StripeSubscription $plugin */
@@ -578,7 +852,7 @@ final class StripeGatewayCallsTest extends KernelTestBase {
     $reflection->getProperty('stripe')->setValue($plugin, $this->stripe);
     $reflection->getProperty('stringTranslation')->setValue($plugin, $this->container->get('string_translation'));
     $reflection->getProperty('orderLock')->setValue($plugin, $this->container->get('commerce_stripe_recurring.order_lock'));
-    $reflection->getProperty('conventions')->setValue($plugin, $site === '' ? $this->container->get('commerce_stripe_recurring.conventions') : new Conventions([], $site));
+    $reflection->getProperty('conventions')->setValue($plugin, $site === '' && $conventions === [] ? $this->container->get('commerce_stripe_recurring.conventions') : new Conventions($conventions, $site));
     $reflection->getProperty('credentials')->setValue($plugin, $this->container->get('commerce_stripe_recurring.credentials'));
     $reflection->getProperty('state')->setValue($plugin, $this->container->get('state'));
 
@@ -594,8 +868,10 @@ final class StripeGatewayCallsTest extends KernelTestBase {
    *   The currency every line is in.
    * @param string $subscription
    *   The subscription paying for it, or nothing.
+   * @param string $state
+   *   The order's state: `draft` for one still in checkout.
    */
-  private function order(array $lines, string $currency = 'EUR', string $subscription = 'sub_test'): Order {
+  private function order(array $lines, string $currency = 'EUR', string $subscription = 'sub_test', string $state = 'completed'): Order {
     $items = [];
     foreach ($lines as [$title, $amount, $quantity]) {
       $item = OrderItem::create(['type' => 'default', 'quantity' => $quantity]);
@@ -607,7 +883,7 @@ final class StripeGatewayCallsTest extends KernelTestBase {
 
     $order = Order::create([
       'type' => 'default',
-      'state' => 'completed',
+      'state' => $state,
       'store_id' => 1,
       'uid' => 1,
       'mail' => 'anna@example.test',
@@ -619,6 +895,37 @@ final class StripeGatewayCallsTest extends KernelTestBase {
     $order->save();
 
     return $order;
+  }
+
+  /**
+   * An adjustment on the order itself, not on a line.
+   */
+  private function discount(string $amount, string $currency = 'EUR'): Adjustment {
+    return new Adjustment([
+      'type' => 'custom',
+      'label' => 'Paid ahead',
+      'amount' => new Price($amount, $currency),
+    ]);
+  }
+
+  /**
+   * The order's total, in cents.
+   */
+  private function cents(Order $order): int {
+    $total = $this->reload($order->id())->getTotalPrice();
+    $this->assertNotNull($total);
+
+    return $this->container->get('commerce_price.minor_units_converter')->toMinorUnits($total);
+  }
+
+  /**
+   * What Stripe would collect for a period of these lines, in cents.
+   *
+   * @param array<int, array<string, mixed>> $lines
+   *   Line items as sent.
+   */
+  private function collected(array $lines): int {
+    return array_sum(array_map(static fn (array $line): int => $line['quantity'] * $line['price_data']['unit_amount'], $lines));
   }
 
   /**

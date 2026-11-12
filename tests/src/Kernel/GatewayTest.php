@@ -260,6 +260,42 @@ final class GatewayTest extends KernelTestBase {
   }
 
   /**
+   * A draft order that was sent to a checkout is not placed on trust.
+   *
+   * The event has to say what its checkout was opened for, and the order's
+   * gateway has to agree. An order already placed is past that.
+   */
+  public function testDraftOrderSentToCheckoutIsNotPlacedOnTrust(): void {
+    // A checkout from before checkouts said what they were opened for.
+    $unsaid = $this->contract(state: 'draft');
+    $unsaid->setData(StripeSubscription::SESSION_KEY, 'cs_before')->save();
+    $invoice = $this->invoice('in_first', 'INV-0042', $unsaid->id());
+
+    $this->assertFalse($this->deliver($invoice), 'An invoice that does not say what it bills placed a draft order.');
+    $this->assertFalse($this->deliver($invoice));
+
+    $unsaid = $this->reload($unsaid->id());
+    $this->assertSame('draft', $unsaid->getState()->getId());
+    $this->assertSame('', (string) $unsaid->getData(RenewalOrders::INVOICE_KEY));
+    $this->assertCount(0, $this->paymentsFor($unsaid->id()));
+    $this->assertSame(['sub_test'], $unsaid->getData(StripeSubscription::MISMATCH_KEY), 'The subscription to cancel and refund is not listed once.');
+
+    // It says what for, and the order names no gateway that could compare.
+    $unnamed = $this->contract(state: 'draft');
+    $said = $this->invoice('in_said', 'INV-0060', $unnamed->id());
+    $said->parent->subscription_details->metadata['csr_contents'] = str_repeat('a', 64);
+
+    $this->assertFalse($this->deliver($said));
+    $this->assertSame('draft', $this->reload($unnamed->id())->getState()->getId());
+
+    // Placed already: settled as ever, whatever it says.
+    $placed = $this->contract();
+    $placed->setData(StripeSubscription::SESSION_KEY, 'cs_before')->save();
+    $this->assertTrue($this->deliver($this->invoice('in_placed', 'INV-0061', $placed->id())));
+    $this->assertNull($this->reload($placed->id())->getData(StripeSubscription::MISMATCH_KEY));
+  }
+
+  /**
    * The €0 invoice a trial starts with is not the first payment.
    *
    * Recorded, it would make the order look paid for a period nobody paid

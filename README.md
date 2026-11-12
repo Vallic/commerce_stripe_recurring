@@ -6,7 +6,8 @@ The gateway plugin is `stripe_subscription`. Nothing sensitive reaches the site:
 
 ## What it does
 
-- **Checkout.** `mode=subscription` for a subscription, `mode=payment` for a one-off payment (`createPaymentCheckoutSession()`). Lines are priced inline from the order's adjusted, tax-inclusive unit prices, so there is no catalogue to keep in Stripe. Months between charges and trial days come from the order or from the gateway's settings.
+- **Checkout.** `mode=subscription` for a subscription, `mode=payment` for a one-off payment (`createPaymentCheckoutSession()`). Lines are priced inline from the order's adjusted, tax-inclusive unit prices, so there is no catalogue to keep in Stripe. Months between charges and trial days come from the order or from the gateway's settings. A line's price is the amount of one charge, unless the site prices its orders [for one month](#orders-priced-for-one-month).
+- **One checkout, one order as shown.** An order has one open checkout at a time, and a checkout places the order only while the order still holds [what it was opened for](#a-checkout-places-what-it-was-opened-for).
 - **Revisions.** `reviseSubscription()` makes the Stripe subscription bill what the order now says. Lines are matched one by one, so changing a quantity does not remove and re-add the line. Proration is `create_prorations`, `always_invoice` or `none`.
 - **Charges in arrears.** `addToNextInvoice()` adds a one-off amount to the subscription's next invoice, with an idempotency key.
 - **Cancellation.** At a date (`cancelSubscriptionAt()`), now (`cancelSubscriptionNow()`), undone (`resumeSubscription()`), or every subscription of a customer at once (`cancelCustomerSubscriptions()`).
@@ -52,6 +53,8 @@ Some names are the site's to choose: what this module writes into order data and
 | `payment_intent_field` | (none) | An order field where the order's payment intent is written, so a refund or a dispute can find the order. |
 | `profile_copy_field` | (none) | A boolean profile field. Where the billing profile has it, each renewal gets its own copy of the profile, marked with it. |
 | `site_metadata_key` | `csr_site` | The metadata key that carries which site made a Stripe object. See [Several sites on one Stripe account](#several-sites-on-one-stripe-account). |
+| `contents_metadata_key` | `csr_contents` | The metadata key that carries what a checkout was opened for. See [A checkout places what it was opened for](#a-checkout-places-what-it-was-opened-for). |
+| `monthly_prices` | `false` | Whether the order is priced for one month. See [Orders priced for one month](#orders-priced-for-one-month). |
 
 Most of these names end up stored in order data or in Stripe, so change them only before any data exists. A site that already has data keeps the names it has been writing.
 
@@ -81,6 +84,48 @@ final class MyModuleServiceProvider extends ServiceProviderBase {
 }
 ```
 
+## Orders priced for one month
+
+By default a line's price is the amount of one charge. An order of 30.00 billed every three months collects 30.00 a quarter, and an adjustment on the order itself, as opposed to on a line, is not sent.
+
+A site that prices its orders for one month, whatever the period, says so:
+
+```yaml
+parameters:
+  commerce_stripe_recurring.conventions:
+    monthly_prices: true
+```
+
+Stripe is then sent the amount for the whole period, so that a period collects the order's total times its months:
+
+- **Months.** Each line's adjusted unit price is multiplied by the months between charges: `INTERVAL_KEY` on the order, or the gateway's setting. 30.00 a month is 90.00 a quarter and 360.00 a year.
+- **The order's own adjustments.** Stripe is given lines only, so an adjustment on the order, such as a discount for paying ahead, is shared over the lines in proportion to what each costs. 30.00 a month with 1.50 off is 85.50 a quarter. Adjustments on a line are in its adjusted unit price already, with or without this key.
+- **To the cent.** What rounding leaves goes to a line of one unit. An order whose every line has a quantity above one can come out a few cents either side, since such a line only moves by its quantity.
+- **One-off payments** have no months: they take the order's adjustments and nothing else.
+- **Nothing to bill.** An order whose adjustments take off as much as its lines cost is refused, as an order of free lines is.
+
+The checkout, the invoiced subscription, `reviseSubscription()` and `revisionApplied()` all read the same lines, so they agree.
+
+Three things to know before switching it on:
+
+- **An adjustment recurs.** Whatever is on the subscription order as an order-level adjustment comes off, or goes on, every period. A credit to be given once does not belong on the subscription order.
+- **Subscriptions already running** at a longer period carry one month's amount per period. Their lines no longer match the order's, so the next `reviseSubscription()` replaces every line. Choose its proration deliberately: `none` bills the right amount from the next renewal, the default credits and charges the rest of the current period.
+- **The order's total stays one month's.** The first invoice of a longer period pays more than the order's total, and the order's balance shows it.
+
+## A checkout places what it was opened for
+
+A checkout shows the customer lines and a trial, and bills those. An order can change while its checkout is open, or after the customer has left it. So:
+
+- **What it was opened for travels with it.** Every Checkout session and every subscription made here carries one value for the lines Stripe was sent (currency, amount, quantity, name and recurrence of each) and the days of trial, under `contents_metadata_key`. Stripe copies a subscription's onto its invoices. `contentsOf()` on the gateway computes the same value from an order.
+- **A draft order is placed only when they agree.** On the return leg, on `checkout.session.completed` and on `invoice.paid`, the value the checkout carries is compared with the order as it stands. Where they differ, the order stays a draft, no subscription is recorded on it and no payment. The customer who came back is sent to the previous checkout step.
+- **What was held back is listed.** The subscription's id is added to the order's `StripeSubscription::MISMATCH_KEY` data, a list, and an error is logged. If that subscription collected money, cancel and refund it: nothing here does.
+- **Placed orders are not compared.** They change afterwards as a matter of course (`reviseSubscription()`).
+- **One open checkout.** Opening a checkout expires the one the order was sent to before, and so does the customer coming back through the cancel address.
+- **The return leg needs a finished checkout.** A session Stripe does not report as `complete` records nothing.
+- **The order names its gateway.** The comparison is made by the gateway plugin in the order's `payment_gateway`, as Commerce's checkout sets it. A draft order whose event carries the value and that names no such gateway is held back too.
+- **Subscriptions made some other way** carry no value. Their events are applied as before, unless the order was sent to a checkout (`SESSION_KEY`).
+- **One-off payments** carry the value too. Granting what was paid for is the site's, and so is the comparison: `openedFor($order, $session)` on the gateway.
+
 ## Several sites on one Stripe account
 
 Stripe sends every event of an account to every webhook endpoint on it, and signs each with that endpoint's own secret. So a site sharing the account with others verifies their events as readily as its own, and their order ids are numbers its own orders have too. Name each site, and each copy of it, in its `settings.php`:
@@ -109,11 +154,18 @@ The order records what the gateway knows, under keys the site can read:
 - `StripeSubscription::SUBSCRIPTION_KEY`, `CUSTOMER_KEY` and `SESSION_KEY`: the subscription, customer and Checkout session ids.
 - `ENDED_KEY` and `ENDED_REASON_KEY`: when the subscription ended, and Stripe's `cancellation_details.reason`.
 - `INTERVAL_KEY` and `TRIAL_KEY`, which the site writes: months between charges and trial days for this order.
+- `MISMATCH_KEY`: the subscriptions of checkouts that were opened for something else than the order held when they were paid, as a list of ids. See [A checkout places what it was opened for](#a-checkout-places-what-it-was-opened-for).
 - `RenewalOrders::INVOICE_KEY`, `RENEWS_KEY`, `INVOICE_URL_KEY`, `PERIOD_START_KEY` and `PERIOD_END_KEY`: the invoice an order records, the order it renews, Stripe's hosted invoice, and the period it covers.
 
 ## Other Stripe events
 
 The webhook submodule dispatches `WebhookEvent` (`commerce_stripe_recurring_webhook.event`) for every verified event, after this module has applied it. A subscriber can act on event types this module ignores, such as identity verification, disputes or one-off payments. If it does, it calls `setHandled()`, and the endpoint reports the event as handled.
+
+## Upgrading
+
+- **Checkouts open during the upgrade.** A session opened by an earlier version does not say what it was opened for, and does not place a draft order. Sessions live a day at most. An order left in draft by one is placed by hand, or by the customer checking out again.
+- **Tests of your own** that hand `OrderEvents` an event for a draft order holding a `SESSION_KEY` need the event to carry the value `createCheckoutSession()` sent.
+- **Prices.** Nothing changes unless `monthly_prices` is set.
 
 ## Tests
 
